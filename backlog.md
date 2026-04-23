@@ -17,8 +17,8 @@ Get the primary machine fully aligned with Claude Code capabilities.
 - [x] **Create plugin synchronization script (`scripts/sync-claude-plugins.py`)**
   - **Status:** Done
   - **Goal:** Read `~/.claude/plugins/cache/`, parse Markdown/YAML from `agents/`, `commands/`, `skills/`, and generate native `SKILL.md` files in `~/.gemini/skills/`.
-- [ ] **Map Claude Hook Events to Gemini**
-  - **Status:** In Progress
+- [x] **Map Claude Hook Events to Gemini**
+  - **Status:** Done
   - **Goal:** Update the migrated `~/.gemini/settings.json` hooks to use Gemini's event lifecycle names instead of Claude's (`PostToolUse` -> Gemini native equivalent).
 
 ---
@@ -28,7 +28,8 @@ Deploy the local parity baseline to M2 (homelab) and WinPC.
 
 ### Milestone 2.1: M2 Homelab Deployment
 - [ ] **Connect via SSH `m2`**
-  - **Status:** To Do
+  - **Status:** In Progress
+  - **Goal:** SSH into `m2` to begin the deployment process.
 - [ ] **Deploy dotfiles & Bootstrap**
   - **Status:** To Do
   - **Goal:** Clone/pull `gemini-dotfiles` and run `bootstrap.sh`.
