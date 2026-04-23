@@ -253,6 +253,26 @@ function gem {
     }
 }
 
+function Ensure-WindowsGemWrapper {
+    $binDir = Join-Path $HOME 'bin'
+    Ensure-Directory -Path $binDir
+
+    $wrapperPath = Join-Path $binDir 'gem.cmd'
+    $wrapperContent = "@echo off`r`n""%AppData%\npm\gemini.cmd"" --approval-mode=yolo %*`r`n"
+    Set-Content -LiteralPath $wrapperPath -Value $wrapperContent -NoNewline
+
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $binDirNormalized = $binDir.TrimEnd('\')
+    $pathEntries = @()
+    if ($userPath) {
+        $pathEntries = $userPath -split ';' | Where-Object { $_ }
+    }
+    if ($pathEntries -notcontains $binDirNormalized) {
+        $newPath = if ($userPath) { $userPath.TrimEnd(';') + ';' + $binDirNormalized } else { $binDirNormalized }
+        [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+    }
+}
+
 function Write-ProjectGeminiWrapper {
     param([Parameter(Mandatory = $true)][string]$ProjectRoot)
 
