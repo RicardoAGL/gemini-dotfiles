@@ -1,24 +1,52 @@
-# Backlog
+# Gemini Dotfiles Backlog
 
-Local fallback tracker for `gemini-dotfiles`.
+Project tracking for the Gemini CLI multi-agent rollout.
 
-## In progress
+---
 
-### [dotfiles] Complete Gemini CLI parity rollout
-- Status: In progress
-- Branch: `main`
-- Tags: `gemini`, `dotfiles`, `migration`, `cross-machine`
-- What: Mirror the Claude-first baseline into Gemini CLI and deploy it consistently to M5, M2, and WinPc.
-- Context: Gemini CLI is now installed on all three machines, the global `GEMINI.md` baseline is generated from Claude, and WinPc uses a concrete `gem.cmd` wrapper instead of relying only on profile loading.
-- Done when: all three machines have a working Gemini entrypoint, managed `~/.gemini` state, and the repo includes enough notes for parallel follow-up work.
+## Phase 1: Local Parity (M5 Machine)
+Get the primary machine fully aligned with Claude Code capabilities.
 
-## To do
+### Milestone 1.1: Core Configuration
+- [x] Bootstrapped global `GEMINI.md` baseline
+- [x] Migrated hooks (`SessionStart`, `PostToolUse`, etc.)
+- [x] Configured global MCP servers (`playwright`, `vibe-kanban`, `nexus`)
+- [x] Enabled Agent Skills (1:1 mapping from Claude)
 
-### [dotfiles] Add richer operator docs for Gemini project onboarding
-- Status: To do
-- Branch: `main`
-- Tags: `docs`, `gemini`, `onboarding`
-- What: Expand the repo notes around `use-project` and project-local `GEMINI.md` wrapper generation.
-- Context: The bootstrap/install path is documented, but the repo-local onboarding path can still use examples from real Claude-first repos.
-- Done when: a new operator can onboard a Claude-first repo into Gemini without needing chat context.
+### Milestone 1.2: Plugin Migration
+- [ ] **Create plugin synchronization script (`scripts/sync-claude-plugins.py`)**
+  - **Status:** To Do
+  - **Goal:** Read `~/.claude/plugins/cache/`, parse Markdown/YAML from `agents/`, `commands/`, `skills/`, and generate native `SKILL.md` files in `~/.gemini/skills/`.
+- [ ] **Map Claude Hook Events to Gemini**
+  - **Status:** To Do
+  - **Goal:** Update the migrated `~/.gemini/settings.json` hooks to use Gemini's event lifecycle names instead of Claude's (`PostToolUse` -> Gemini native equivalent).
+
+---
+
+## Phase 2: Cross-Machine Rollout
+Deploy the local parity baseline to M2 (homelab) and WinPC.
+
+### Milestone 2.1: M2 Homelab Deployment
+- [ ] **Connect via SSH `m2`**
+  - **Status:** To Do
+- [ ] **Deploy dotfiles & Bootstrap**
+  - **Status:** To Do
+  - **Goal:** Clone/pull `gemini-dotfiles` and run `bootstrap.sh`.
+- [ ] **Sync Plugins & Hooks**
+  - **Status:** To Do
+  - **Goal:** Run `sync-claude-plugins.py` and ensure hook names are correctly mapped.
+- [ ] **Verify Nexus Communication**
+  - **Status:** To Do
+  - **Goal:** Confirm `gemini mcp` shows `nexus` as connected and test cross-machine messaging.
+
+### Milestone 2.2: WinPC Deployment
+- [ ] **Connect via SSH `winpc`**
+  - **Status:** To Do
+- [ ] **Deploy dotfiles & Bootstrap**
+  - **Status:** To Do
+  - **Goal:** Clone/pull `gemini-dotfiles` and run `bootstrap.ps1`.
+- [ ] **Sync Plugins & Hooks**
+  - **Status:** To Do
+- [ ] **Verify Nexus Communication**
+  - **Status:** To Do
 
