@@ -14,11 +14,11 @@ Get the primary machine fully aligned with Claude Code capabilities.
 - [x] Enabled Agent Skills (1:1 mapping from Claude)
 
 ### Milestone 1.2: Plugin Migration
-- [ ] **Create plugin synchronization script (`scripts/sync-claude-plugins.py`)**
-  - **Status:** To Do
+- [x] **Create plugin synchronization script (`scripts/sync-claude-plugins.py`)**
+  - **Status:** Done
   - **Goal:** Read `~/.claude/plugins/cache/`, parse Markdown/YAML from `agents/`, `commands/`, `skills/`, and generate native `SKILL.md` files in `~/.gemini/skills/`.
 - [ ] **Map Claude Hook Events to Gemini**
-  - **Status:** To Do
+  - **Status:** In Progress
   - **Goal:** Update the migrated `~/.gemini/settings.json` hooks to use Gemini's event lifecycle names instead of Claude's (`PostToolUse` -> Gemini native equivalent).
 
 ---
