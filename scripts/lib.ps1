@@ -16,6 +16,40 @@ function Get-SourceMap {
     return Get-Content -Raw $basePath | ConvertFrom-Json
 }
 
+function ConvertTo-PlainHashtable {
+    param([Parameter(Mandatory = $true)]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    if ($Value -is [System.Collections.IDictionary]) {
+        $result = @{}
+        foreach ($key in $Value.Keys) {
+            $result[$key] = ConvertTo-PlainHashtable -Value $Value[$key]
+        }
+        return $result
+    }
+
+    if ($Value -is [pscustomobject]) {
+        $result = @{}
+        foreach ($property in $Value.PSObject.Properties) {
+            $result[$property.Name] = ConvertTo-PlainHashtable -Value $property.Value
+        }
+        return $result
+    }
+
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $items = New-Object System.Collections.ArrayList
+        foreach ($item in $Value) {
+            [void]$items.Add((ConvertTo-PlainHashtable -Value $item))
+        }
+        return ,$items.ToArray()
+    }
+
+    return $Value
+}
+
 function Get-SourceMapValue {
     param([Parameter(Mandatory = $true)][string]$PathKey)
 
@@ -157,7 +191,7 @@ function Merge-ManagedSettings {
     }
 
     $currentRaw = Get-Content -Raw $Path
-    $current = if ($currentRaw.Trim()) { $currentRaw | ConvertFrom-Json -AsHashtable } else { @{} }
+    $current = if ($currentRaw.Trim()) { ConvertTo-PlainHashtable -Value ($currentRaw | ConvertFrom-Json) } else { @{} }
     $managed = @{
         general = @{
             defaultApprovalMode = 'default'
@@ -242,4 +276,3 @@ function Write-ProjectGeminiWrapper {
     Set-Content -LiteralPath $target -Value ($lines -join [Environment]::NewLine)
     return $target
 }
-
