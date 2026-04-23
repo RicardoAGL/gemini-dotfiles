@@ -27,27 +27,27 @@ Get the primary machine fully aligned with Claude Code capabilities.
 Deploy the local parity baseline to M2 (homelab) and WinPC.
 
 ### Milestone 2.1: M2 Homelab Deployment
-- [ ] **Connect via SSH `m2`**
-  - **Status:** In Progress
+- [x] **Connect via SSH `m2`**
+  - **Status:** Done
   - **Goal:** SSH into `m2` to begin the deployment process.
-- [ ] **Deploy dotfiles & Bootstrap**
-  - **Status:** To Do
+- [x] **Deploy dotfiles & Bootstrap**
+  - **Status:** Done
   - **Goal:** Clone/pull `gemini-dotfiles` and run `bootstrap.sh`.
-- [ ] **Sync Plugins & Hooks**
-  - **Status:** To Do
+- [x] **Sync Plugins & Hooks**
+  - **Status:** Done
   - **Goal:** Run `sync-claude-plugins.py` and ensure hook names are correctly mapped.
-- [ ] **Verify Nexus Communication**
-  - **Status:** To Do
+- [x] **Verify Nexus Communication**
+  - **Status:** Done
   - **Goal:** Confirm `gemini mcp` shows `nexus` as connected and test cross-machine messaging.
 
 ### Milestone 2.2: WinPC Deployment
-- [ ] **Connect via SSH `winpc`**
-  - **Status:** To Do
-- [ ] **Deploy dotfiles & Bootstrap**
-  - **Status:** To Do
+- [x] **Connect via SSH `winpc`**
+  - **Status:** Done
+- [x] **Deploy dotfiles & Bootstrap**
+  - **Status:** Done
   - **Goal:** Clone/pull `gemini-dotfiles` and run `bootstrap.ps1`.
-- [ ] **Sync Plugins & Hooks**
-  - **Status:** To Do
-- [ ] **Verify Nexus Communication**
-  - **Status:** To Do
+- [x] **Sync Plugins & Hooks**
+  - **Status:** Done
+- [x] **Verify Nexus Communication**
+  - **Status:** Done
 
