@@ -1,0 +1,24 @@
+{
+  "canonical": {
+    "claudeDotfilesRepo": "claude-dotfiles",
+    "securityBaselineRepo": "xebia-ai-security-baseline",
+    "tokenGuardRepo": "claude-token-guard"
+  },
+  "global": {
+    "geminiHomeDirName": ".gemini",
+    "contextFileName": "GEMINI.md",
+    "settingsFileName": "settings.json"
+  },
+  "translation": {
+    "globalGeminiSections": [
+      "## Git & Commits",
+      "## Security Essentials",
+      "## Token Optimization",
+      "## Research-First Protocol",
+      "## 3-Layer Memory (see policies.md § Memory Architecture)",
+      "## Process Improvement",
+      "## New Project Standards"
+    ]
+  }
+}
+
