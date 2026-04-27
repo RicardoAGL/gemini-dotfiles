@@ -14,9 +14,9 @@ path = pathlib.Path(r"$root/source-map.json")
 data = json.loads(path.read_text())
 assert data["global"]["contextFileName"] == "GEMINI.md"
 assert data["global"]["settingsFileName"] == "settings.json"
+assert data["integrations"]["infisicalWrapper"]["repoPath"] == "infisical-safe-wrapper"
 print("OK  source-map structure")
 PY
 
 echo
 echo 'Local CI baseline passed.'
-

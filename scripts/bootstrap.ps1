@@ -10,7 +10,9 @@ $mode = New-LinkOrCopy -Source $generatedContext -Target $targetContext
 Merge-ManagedSettings -Path (Get-GeminiSettingsPath)
 Ensure-PowerShellGemFunction
 Ensure-WindowsGemWrapper
+Ensure-InfisicalSafeWrapper
 
 Write-Host "Global GEMINI.md: $mode -> $targetContext"
 Write-Host "Managed settings: $(Get-GeminiSettingsPath)"
 Write-Host 'Windows wrapper ensured: gem -> gemini --approval-mode=yolo'
+Write-Host 'Shared wrapper ensured: infisical-safe-wrapper'

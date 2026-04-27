@@ -14,6 +14,7 @@ Write-Host '==> source-map structure'
 $map = Get-Content -Raw (Join-Path $root 'source-map.json') | ConvertFrom-Json
 if ($map.global.contextFileName -ne 'GEMINI.md') { throw 'Unexpected context file name.' }
 if ($map.global.settingsFileName -ne 'settings.json') { throw 'Unexpected settings file name.' }
+if ($map.integrations.infisicalWrapper.repoPath -ne 'infisical-safe-wrapper') { throw 'Unexpected infisical wrapper repo path.' }
 Write-Host 'OK  source-map structure'
 
 Write-Host ''
