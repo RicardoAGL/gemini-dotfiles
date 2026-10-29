@@ -21,6 +21,10 @@ if command -v agy >/dev/null 2>&1; then
   agy plugin install "$(get_gemini_dotfiles_root)/plugins/claude-governance" >/dev/null 2>&1 || true
 fi
 
+if command -v "$(get_python_cmd)" >/dev/null 2>&1; then
+  "$(get_python_cmd)" "$(dirname "${BASH_SOURCE[0]}")/sync-claude-plugins.py"
+fi
+
 echo "Global GEMINI.md: $mode -> $target_context"
 echo "Managed settings: $(get_gemini_settings_path)"
 echo "Shell aliases ensured: gem, agyx, antigravity"
