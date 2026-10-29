@@ -17,7 +17,11 @@ else
   echo "Skipping infisical-safe-wrapper install because repo is missing: $infisical_wrapper_repo"
 fi
 
+if command -v agy >/dev/null 2>&1; then
+  agy plugin install "$(get_gemini_dotfiles_root)/plugins/claude-governance" >/dev/null 2>&1 || true
+fi
+
 echo "Global GEMINI.md: $mode -> $target_context"
 echo "Managed settings: $(get_gemini_settings_path)"
-echo "Shell alias ensured: gem -> gemini --approval-mode=yolo"
+echo "Shell aliases ensured: gem, agyx, antigravity"
 echo "Shared wrapper ensured: infisical-safe-wrapper"
