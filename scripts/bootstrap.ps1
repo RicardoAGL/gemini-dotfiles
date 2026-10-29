@@ -12,6 +12,10 @@ Ensure-PowerShellGemFunction
 Ensure-WindowsGemWrapper
 Ensure-InfisicalSafeWrapper
 
+if (Get-Command python -ErrorAction SilentlyContinue) {
+    & python (Join-Path $PSScriptRoot 'sync-claude-plugins.py')
+}
+
 Write-Host "Global GEMINI.md: $mode -> $targetContext"
 Write-Host "Managed settings: $(Get-GeminiSettingsPath)"
 Write-Host 'Windows wrapper ensured: gem -> gemini --approval-mode=yolo'
