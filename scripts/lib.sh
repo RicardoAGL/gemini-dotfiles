@@ -171,7 +171,7 @@ merge_managed_settings() {
   local settings_path="$1"
   ensure_dir "$(dirname "$settings_path")"
   touch "$settings_path"
-  SETTINGS_PATH="$settings_path" "$(get_python_cmd)" - <<'PY'
+  SETTINGS_PATH="$settings_path" "$(get_python_cmd)" -c '
 import json
 import os
 from pathlib import Path
@@ -217,16 +217,22 @@ def merge(base, override):
 
 merged = merge(current, managed)
 path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
-PY
+'
 }
 
 ensure_unix_alias() {
   local profile="$1"
-  local alias_line="alias gem='gemini --approval-mode=yolo'"
   touch "$profile"
-  if ! grep -Fqx "$alias_line" "$profile"; then
-    printf '\n%s\n' "$alias_line" >> "$profile"
-  fi
+  local line
+  for line in \
+    "alias gem='gemini --approval-mode=yolo'" \
+    "alias agyx='agy --dangerously-skip-permissions'" \
+    "alias antigravity='agy'"
+  do
+    if ! grep -Fqx "$line" "$profile"; then
+      printf '\n%s\n' "$line" >> "$profile"
+    fi
+  done
 }
 
 ensure_infisical_safe_wrapper_shell_wrapper() {

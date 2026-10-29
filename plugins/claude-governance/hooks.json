@@ -1,0 +1,37 @@
+{
+  "claude-governance": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command|read_file|edit_file|write_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node scripts/bridge-pretooluse.js",
+            "timeout": 180
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "node scripts/bridge-sessionstart.js",
+        "timeout": 35
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node scripts/bridge-preinvocation.js",
+        "timeout": 10
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node scripts/bridge-stop.js",
+        "timeout": 30
+      }
+    ]
+  }
+}
