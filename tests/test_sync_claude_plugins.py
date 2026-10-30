@@ -13,6 +13,7 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -687,6 +688,146 @@ class SkillSyncTests(unittest.TestCase):
 
         self.assertFalse((self.target / "alpha").exists())
         self.assertFalse((self.target / self.module.TRANSACTION_NAME).exists())
+
+    def test_component_guard_rejects_mocked_windows_reparse_attribute(self):
+        reparse_flag = getattr(self.module.stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        component = self.root / "reparse-component"
+        component.mkdir()
+        original_lstat = self.module.os.lstat
+
+        def lstat_with_reparse(path):
+            result = original_lstat(path)
+            if Path(path) == component:
+                return SimpleNamespace(
+                    st_mode=result.st_mode,
+                    st_file_attributes=reparse_flag,
+                )
+            return result
+
+        with mock.patch.object(self.module.os, "lstat", side_effect=lstat_with_reparse):
+            with self.assertRaises(self.module.SyncError):
+                self.module.assert_no_symlink_components(
+                    component / "target", "mocked Windows path"
+                )
+
+    def test_component_reparse_helper_honors_path_is_junction(self):
+        path = mock.Mock()
+        path.is_junction.return_value = True
+        info = SimpleNamespace(st_mode=self.module.stat.S_IFDIR, st_file_attributes=0)
+
+        self.assertTrue(self.module.component_is_link_or_reparse(path, info))
+
+    @unittest.skipUnless(os.name == "nt", "real junction test requires Windows")
+    def test_component_guard_rejects_real_windows_junction(self):
+        external = self.root / "junction-external"
+        junction = self.root / "junction"
+        external.mkdir()
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(junction), str(external)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            self.skipTest(f"junction creation unavailable: {result.stderr.strip()}")
+
+        with self.assertRaises(self.module.SyncError):
+            self.module.assert_no_symlink_components(
+                junction / "target", "real Windows junction path"
+            )
+
+    def test_windows_process_probe_reports_active_and_closes_handle(self):
+        kernel = FakeWindowsKernel(
+            handle=123,
+            exit_code=self.module.WINDOWS_STILL_ACTIVE,
+            wait_result=self.module.WINDOWS_WAIT_TIMEOUT,
+        )
+        with mock.patch.object(
+            self.module, "load_windows_kernel32", return_value=kernel
+        ):
+            self.assertTrue(self.module.windows_process_is_active(9876))
+
+        self.assertEqual(kernel.closed_handles, [123])
+
+    def test_windows_process_probe_reports_exited_and_closes_handle(self):
+        kernel = FakeWindowsKernel(
+            handle=456,
+            exit_code=0,
+            wait_result=self.module.WINDOWS_WAIT_OBJECT_0,
+        )
+        with mock.patch.object(
+            self.module, "load_windows_kernel32", return_value=kernel
+        ):
+            self.assertFalse(self.module.windows_process_is_active(9876))
+
+        self.assertEqual(kernel.closed_handles, [456])
+
+    def test_windows_process_probe_fails_closed_on_access_or_query_error(self):
+        inaccessible = FakeWindowsKernel(handle=0)
+        query_error = FakeWindowsKernel(
+            handle=789,
+            exit_code=0,
+            wait_result=self.module.WINDOWS_WAIT_OBJECT_0,
+            query_succeeds=False,
+        )
+        with mock.patch.object(
+            self.module, "load_windows_kernel32", return_value=inaccessible
+        ):
+            self.assertTrue(self.module.windows_process_is_active(9876))
+        with mock.patch.object(
+            self.module, "load_windows_kernel32", return_value=query_error
+        ):
+            self.assertTrue(self.module.windows_process_is_active(9876))
+
+        self.assertEqual(query_error.closed_handles, [789])
+
+    def test_windows_owner_probe_never_invokes_os_kill(self):
+        owner = {
+            "token": "a" * 32,
+            "pid": 9876,
+            "host": self.module.socket.gethostname(),
+            "createdAt": "2026-10-30T00:00:00+00:00",
+        }
+        with (
+            mock.patch.object(self.module, "running_on_windows", return_value=True),
+            mock.patch.object(
+                self.module, "windows_process_is_active", return_value=True
+            ) as process_probe,
+            mock.patch.object(self.module.os, "kill") as kill,
+        ):
+            self.assertTrue(self.module.owner_is_active(owner))
+
+        process_probe.assert_called_once_with(9876)
+        kill.assert_not_called()
+
+
+class FakeWindowsKernel:
+    def __init__(
+        self,
+        *,
+        handle: int,
+        exit_code: int = 0,
+        wait_result: int = 0,
+        query_succeeds: bool = True,
+    ):
+        self.handle = handle
+        self.exit_code = exit_code
+        self.wait_result = wait_result
+        self.query_succeeds = query_succeeds
+        self.closed_handles: list[int] = []
+
+    def OpenProcess(self, _access, _inherit, _pid):
+        return self.handle
+
+    def GetExitCodeProcess(self, _handle, code_pointer):
+        code_pointer._obj.value = self.exit_code
+        return self.query_succeeds
+
+    def WaitForSingleObject(self, _handle, _timeout):
+        return self.wait_result
+
+    def CloseHandle(self, handle):
+        self.closed_handles.append(handle)
+        return True
 
 
 if __name__ == "__main__":
