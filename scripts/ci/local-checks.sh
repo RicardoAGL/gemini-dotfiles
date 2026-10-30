@@ -15,8 +15,13 @@ data = json.loads(path.read_text())
 assert data["global"]["contextFileName"] == "GEMINI.md"
 assert data["global"]["settingsFileName"] == "settings.json"
 assert data["integrations"]["infisicalWrapper"]["repoPath"] == "infisical-safe-wrapper"
+assert data["integrations"]["infisicalWrapper"]["remoteUrl"] == "https://github.com/RicardoAGL/infisical-safe-wrapper.git"
 print("OK  source-map structure")
 PY
+
+echo '==> Infisical wrapper boundary tests'
+bash "$root/tests/infisical-wrapper/run-tests.sh"
+echo 'OK  Infisical wrapper boundary tests'
 
 echo '==> managed skill sync tests'
 PYTHONDONTWRITEBYTECODE=1 python3 "$root/tests/test_sync_claude_plugins.py" -v
