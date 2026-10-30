@@ -79,8 +79,9 @@ powershell -ExecutionPolicy Bypass -File C:\github\gemini-dotfiles\scripts\ci\lo
 - Claude-first repos -> repo-local `GEMINI.md`: generated wrapper that imports `AGENTS.md` and/or `CLAUDE.md`
 - Reviewed Claude skills -> complete, validated directories under `~/.gemini/skills`
 - Enabled Claude plugins -> real `skills/` packages, including their `scripts/`, `references/`, and `assets/`; command or agent documents are used only when they are valid standalone skills
-- The versioned sibling `claude-dotfiles/skills` checkout is the preferred canonical source; deployed `~/.claude/skills` is a fallback when that checkout is unavailable
-- `.claude-sync-manifest.json` records sync ownership, source, plugin version, and content hash so repeat runs can safely refresh or retire managed snapshots
+- The sibling `claude-dotfiles/skills` checkout is preferred only when its repository is clean, on `main`, and exactly matches `origin/main`; deployed `~/.claude/skills` is a separately identified, content-attested fallback when that checkout is unavailable
+- `.claude-sync-manifest.json` schema v2 records sync ownership, the verified source revision or fallback attestation, plugin version, and content hash
+- Every changed package is staged and revalidated before one journaled transaction activates anything; a failed activation or manifest write rolls back the full set, and the next run recovers an interrupted transaction
 - Existing Gemini auth material under `~/.gemini` is preserved
 - Existing user settings are preserved and merged with the managed defaults
 
@@ -98,6 +99,10 @@ powershell -ExecutionPolicy Bypass -File C:\github\gemini-dotfiles\scripts\ci\lo
 - Existing Gemini auth files are not touched.
 - Existing Gemini settings are merged, not replaced wholesale.
 - Unmanaged entries under `~/.gemini/skills` are never overwritten or removed, including same-name collisions.
+- Ownership is never inferred from matching content. Only manifest-owned snapshots and exact legacy repository symlinks are reconciled.
+- Stale owned snapshots are moved to timestamped batches under `~/.gemini/skills/.claude-sync-quarantine/` with reason and source-hash metadata; they are not permanently deleted.
+- Plugin and marketplace identifiers are validated before cache lookup, and symlinked or out-of-cache packages are rejected.
+- Plugin cache versions use parsed numeric version ordering with a deterministic lexical fallback; filesystem modification time is never treated as version authority.
 - Invalid skill frontmatter, modified managed snapshots, missing Python, and other parity failures stop bootstrap with a non-zero exit.
 - YOLO mode is only enabled through the shell shortcut, not forced into persistent settings.
 
