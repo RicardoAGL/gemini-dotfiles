@@ -3,5 +3,5 @@
   "name": "claude-governance",
   "displayName": "Claude Governance",
   "description": "Enforces machine security baseline, secret protection, command gating, and session synchronization mirrored from canonical Claude Code.",
-  "version": "1.0.1"
+  "version": "1.0.2"
 }

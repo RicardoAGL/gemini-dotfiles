@@ -332,14 +332,96 @@ function Ensure-WindowsGemWrapper {
     }
 }
 
-function Remove-GovernanceAgyx {
-    $binDir = Get-UserBinDir
-    foreach ($name in @('agyx.cmd', 'agyx.ps1')) {
-        $candidate = Join-Path $binDir $name
-        if (Test-Path -LiteralPath $candidate) {
-            Remove-Item -LiteralPath $candidate -Force
+function Resolve-PythonCommand {
+    param([scriptblock]$Resolver)
+
+    if (-not $Resolver) {
+        $Resolver = {
+            param([string]$Name)
+            Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue
         }
     }
+    foreach ($name in @('python', 'python3')) {
+        $command = @(& $Resolver $name) | Select-Object -First 1
+        if ($command -and $command.Source) { return $command }
+    }
+    throw 'Python is required but neither python nor python3 is available.'
+}
+
+function Assert-SafeCmdPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if ($Path -match '[\r\n"%!^&|<>()]') {
+        throw 'Wrapper paths contain unsupported cmd.exe metacharacters.'
+    }
+}
+
+function New-GovernanceAgyxCmdContent {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonPath,
+        [Parameter(Mandatory = $true)][string]$InstallerPath,
+        [Parameter(Mandatory = $true)][string]$PluginPath,
+        [Parameter(Mandatory = $true)][string]$AgyPath
+    )
+    foreach ($value in @($PythonPath, $InstallerPath, $PluginPath, $AgyPath)) {
+        Assert-SafeCmdPath -Path $value
+    }
+    return [string]::Join("`r`n", @(
+        '@echo off',
+        "`"$PythonPath`" `"$InstallerPath`" --check-only --agy `"$AgyPath`" --plugin-dir `"$PluginPath`" >nul",
+        'if errorlevel 1 exit /b %errorlevel%',
+        "`"$AgyPath`" --dangerously-skip-permissions %*",
+        ''
+    ))
+}
+
+function New-InfisicalCmdContent {
+    param([Parameter(Mandatory = $true)][string]$PythonPath)
+    Assert-SafeCmdPath -Path $PythonPath
+    return [string]::Join("`r`n", @(
+        '@echo off',
+        "`"$PythonPath`" `"%~dp0\.infisical-safe-wrapper-runtime.py`" `"%~dp0\.infisical-safe-wrapper.json`" %*",
+        ''
+    ))
+}
+
+function Remove-GovernanceAgyx {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonPath,
+        [Parameter(Mandatory = $true)][string]$InstallerPath,
+        [Parameter(Mandatory = $true)][string]$PluginPath,
+        [Parameter(Mandatory = $true)][string]$AgyPath,
+        [string]$BinDir = (Get-UserBinDir)
+    )
+
+    $ps1Path = Join-Path $BinDir 'agyx.ps1'
+    if (Test-Path -LiteralPath $ps1Path) {
+        throw "Refusing to modify unmanaged agyx.ps1 collision: $ps1Path"
+    }
+
+    $cmdPath = Join-Path $BinDir 'agyx.cmd'
+    if (-not (Test-Path -LiteralPath $cmdPath)) { return }
+    $item = Get-Item -LiteralPath $cmdPath -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.PSIsContainer) {
+        throw "Refusing to replace redirected or non-file agyx.cmd: $cmdPath"
+    }
+    $expected = New-GovernanceAgyxCmdContent -PythonPath $PythonPath -InstallerPath $InstallerPath -PluginPath $PluginPath -AgyPath $AgyPath
+    $actual = [IO.File]::ReadAllText($cmdPath)
+    if ($actual -cne $expected) {
+        throw "Refusing to replace unverified agyx.cmd collision: $cmdPath"
+    }
+
+    $quarantineDir = Join-Path $BinDir '.gemini-dotfiles-quarantine'
+    if (Test-Path -LiteralPath $quarantineDir) {
+        $quarantineItem = Get-Item -LiteralPath $quarantineDir -Force
+        if (($quarantineItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $quarantineItem.PSIsContainer) {
+            throw "Invalid agyx quarantine directory: $quarantineDir"
+        }
+    } else {
+        Ensure-Directory -Path $quarantineDir
+    }
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+    $destination = Join-Path $quarantineDir ("agyx.cmd.$stamp." + [Guid]::NewGuid().ToString('N'))
+    Move-Item -LiteralPath $cmdPath -Destination $destination
 }
 
 function Install-GovernanceAgyx {
@@ -347,25 +429,24 @@ function Install-GovernanceAgyx {
         [Parameter(Mandatory = $true)][string]$PythonPath,
         [Parameter(Mandatory = $true)][string]$InstallerPath,
         [Parameter(Mandatory = $true)][string]$PluginPath,
-        [Parameter(Mandatory = $true)][string]$AgyPath
+        [Parameter(Mandatory = $true)][string]$AgyPath,
+        [string]$BinDir = (Get-UserBinDir)
     )
 
-    foreach ($value in @($PythonPath, $InstallerPath, $PluginPath, $AgyPath)) {
-        if ($value -match '[\r\n"%!^&|<>()]') {
-            throw 'Governance wrapper paths contain unsupported cmd.exe metacharacters.'
-        }
+    Ensure-Directory -Path $BinDir
+    $wrapperPath = Join-Path $BinDir 'agyx.cmd'
+    $ps1Path = Join-Path $BinDir 'agyx.ps1'
+    if ((Test-Path -LiteralPath $wrapperPath) -or (Test-Path -LiteralPath $ps1Path)) {
+        throw "Refusing to overwrite an existing agyx command in $BinDir"
     }
-
-    $binDir = Get-UserBinDir
-    Ensure-Directory -Path $binDir
-    $wrapperPath = Join-Path $binDir 'agyx.cmd'
-    $wrapperContent = @"
-@echo off
-"$PythonPath" "$InstallerPath" --check-only --agy "$AgyPath" --plugin-dir "$PluginPath" >nul
-if errorlevel 1 exit /b %errorlevel%
-"$AgyPath" --dangerously-skip-permissions %*
-"@
-    Set-Content -LiteralPath $wrapperPath -Value $wrapperContent -NoNewline
+    $wrapperContent = New-GovernanceAgyxCmdContent -PythonPath $PythonPath -InstallerPath $InstallerPath -PluginPath $PluginPath -AgyPath $AgyPath
+    $temporary = "$wrapperPath.tmp.$([Guid]::NewGuid().ToString('N'))"
+    try {
+        [IO.File]::WriteAllText($temporary, $wrapperContent, [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporary -Destination $wrapperPath
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
 }
 
 function Ensure-InfisicalSafeWrapper {
@@ -376,9 +457,7 @@ function Ensure-InfisicalSafeWrapper {
     }
     $binDir = Get-UserBinDir
     Ensure-Directory -Path $binDir
-    $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
-    if (-not $pythonCommand) { $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue }
-    if (-not $pythonCommand) { throw 'Python is required to install infisical-safe-wrapper.' }
+    $pythonCommand = Resolve-PythonCommand
     $expectedRemote = Get-CanonicalSourceMapValue -PathKey 'integrations.infisicalWrapper.remoteUrl'
     $commit = (& git -C $wrapperRepo rev-parse HEAD 2>$null).Trim()
     if ($LASTEXITCODE -ne 0 -or $commit -cnotmatch '^[0-9a-f]{40}$') {
@@ -407,7 +486,7 @@ function Ensure-InfisicalSafeWrapper {
         Set-Content -LiteralPath $configTemp -Value (($config | ConvertTo-Json -Compress) + "`n") -NoNewline
         & $pythonCommand.Source $runtimeTemp --verify-only $configTemp
         if ($LASTEXITCODE -ne 0) { throw 'Infisical wrapper provenance verification failed.' }
-        $cmdContent = "@echo off`r`npython ""%~dp0\.infisical-safe-wrapper-runtime.py"" ""%~dp0\.infisical-safe-wrapper.json"" %*`r`n"
+        $cmdContent = New-InfisicalCmdContent -PythonPath $pythonCommand.Source
         $ps1Content = @'
 $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
 if (-not $pythonCommand) { $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue }
@@ -415,7 +494,7 @@ if (-not $pythonCommand) { throw 'Python is required to run infisical-safe-wrapp
 & $pythonCommand.Source (Join-Path $PSScriptRoot '.infisical-safe-wrapper-runtime.py') (Join-Path $PSScriptRoot '.infisical-safe-wrapper.json') @args
 exit $LASTEXITCODE
 '@
-        Set-Content -LiteralPath $cmdTemp -Value $cmdContent -NoNewline
+        [IO.File]::WriteAllText($cmdTemp, $cmdContent, [Text.UTF8Encoding]::new($false))
         Set-Content -LiteralPath $ps1Temp -Value $ps1Content -NoNewline
         Move-Item -Force -LiteralPath $runtimeTemp -Destination $runtimePath
         Move-Item -Force -LiteralPath $configTemp -Destination $configPath

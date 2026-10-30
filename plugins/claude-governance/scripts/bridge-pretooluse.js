@@ -40,25 +40,65 @@ function requireAbsolutePath(value, fieldName, platform) {
   return value;
 }
 
-function mapToolCall(event, platform = process.platform) {
+function requireDirectory(value, fieldName, platform, fileSystem) {
+  const lexical = requireAbsolutePath(value, fieldName, platform);
+  let info;
+  let physical;
+  try {
+    info = fileSystem.statSync(lexical);
+    physical = fileSystem.realpathSync(lexical);
+  } catch (error) {
+    throw new Error(`${fieldName} must be an existing directory: ${error.message}`);
+  }
+  if (!info || typeof info.isDirectory !== "function" || !info.isDirectory()) {
+    throw new Error(`${fieldName} must be an existing directory`);
+  }
+  if (!isAbsoluteForPlatform(physical, platform)) {
+    throw new Error(`${fieldName} did not resolve to an absolute directory`);
+  }
+  const paths = platform === "win32" ? path.win32 : path.posix;
+  return { lexical: paths.normalize(lexical), physical: paths.normalize(physical) };
+}
+
+function validateWorkspaces(event, platform, fileSystem) {
+  if (!Array.isArray(event.workspacePaths) || event.workspacePaths.length === 0) {
+    throw new Error("workspacePaths must contain existing absolute directories");
+  }
+  return event.workspacePaths.map((workspace, index) =>
+    requireDirectory(workspace, `workspacePaths[${index}]`, platform, fileSystem)
+  );
+}
+
+function classifyToolCall(event, options = {}) {
+  const platform = options.platform || process.platform;
+  const fileSystem = options.fileSystem || fs;
   if (!isPlainObject(event) || !isPlainObject(event.toolCall) || !isPlainObject(event.toolCall.args)) {
     throw new Error("Invalid Antigravity hook event schema");
   }
 
-  const workspaces = event.workspacePaths;
-  if (!Array.isArray(workspaces) || workspaces.length === 0 || workspaces.some((entry) => !isAbsoluteForPlatform(entry, platform))) {
-    throw new Error("workspacePaths must contain absolute paths");
-  }
+  const workspaces = validateWorkspaces(event, platform, fileSystem);
 
   const { name, args } = event.toolCall;
   let toolName;
   let toolInput;
-  let cwd = workspaces[0];
+  let cwd = workspaces[0].physical;
 
   switch (name) {
     case "view_file":
       toolName = "Read";
       toolInput = { file_path: requireAbsolutePath(args.AbsolutePath, "AbsolutePath", platform) };
+      break;
+    case "list_dir":
+      toolName = "Read";
+      toolInput = { file_path: requireAbsolutePath(args.DirectoryPath, "DirectoryPath", platform) };
+      break;
+    case "find_by_name":
+      toolName = "Read";
+      toolInput = { file_path: requireAbsolutePath(args.SearchDirectory, "SearchDirectory", platform) };
+      break;
+    case "grep_search":
+      toolName = "Read";
+      toolInput = { file_path: requireAbsolutePath(args.SearchPath, "SearchPath", platform) };
       break;
     case "write_to_file":
       toolName = "Write";
@@ -86,23 +126,72 @@ function mapToolCall(event, platform = process.platform) {
       if (typeof args.CommandLine !== "string" || args.CommandLine.trim() === "" || args.CommandLine.includes("\0")) {
         throw new Error("CommandLine must be a non-empty string");
       }
-      cwd = requireAbsolutePath(args.Cwd, "Cwd", platform);
-      if (!workspaces.some((workspace) => pathIsWithin(cwd, workspace, platform))) {
-        throw new Error("Cwd must stay within a declared workspace");
+      {
+        const commandDirectory = requireDirectory(args.Cwd, "Cwd", platform, fileSystem);
+        const contained = workspaces.some(
+          (workspace) =>
+            pathIsWithin(commandDirectory.lexical, workspace.lexical, platform) &&
+            pathIsWithin(commandDirectory.physical, workspace.physical, platform)
+        );
+        if (!contained) {
+          throw new Error("Cwd must stay physically within a declared workspace");
+        }
+        cwd = commandDirectory.physical;
       }
       toolName = "Bash";
       toolInput = { command: args.CommandLine };
       break;
+    case "manage_task":
+      if (args.Action === "list" || args.Action === "status") return { kind: "allow" };
+      if (args.Action === "kill" || args.Action === "send_input") {
+        return { kind: "force_ask", reason: `Background task ${args.Action} requires approval` };
+      }
+      throw new Error("Unsupported manage_task action");
+    case "manage_subagents":
+      if (args.Action === "list") return { kind: "allow" };
+      if (args.Action === "kill" || args.Action === "kill_all") {
+        return { kind: "force_ask", reason: `Subagent ${args.Action} requires approval` };
+      }
+      throw new Error("Unsupported manage_subagents action");
+    case "list_permissions":
+      return { kind: "allow" };
+    case "ask_question":
+      if (!Array.isArray(args.questions)) throw new Error("ask_question questions must be an array");
+      return { kind: "allow" };
+    case "search_web":
+    case "read_url_content":
+      return { kind: "force_ask", reason: `${name} network access requires approval` };
+    case "schedule":
+      return { kind: "force_ask", reason: "Autonomous scheduling requires approval" };
+    case "ask_permission":
+      return { kind: "force_ask", reason: "Permission expansion requires approval" };
+    case "invoke_subagent":
+    case "define_subagent":
+    case "send_message":
+      return { kind: "force_ask", reason: `${name} agent action requires approval` };
+    case "generate_image":
+      return { kind: "force_ask", reason: "Media generation requires approval" };
     default:
-      throw new Error(`Unsupported governed tool: ${String(name)}`);
+      throw new Error(`Unknown or unsupported governed tool: ${String(name)}`);
   }
 
-  return { tool_name: toolName, tool_input: toolInput, cwd };
+  return { kind: "guard", payload: { tool_name: toolName, tool_input: toolInput, cwd } };
+}
+
+function mapToolCall(event, platform = process.platform, fileSystem = fs) {
+  const classification = classifyToolCall(event, { platform, fileSystem });
+  if (classification.kind !== "guard") {
+    throw new Error("Tool does not map to an executable Claude guard payload");
+  }
+  return classification.payload;
 }
 
 function validateGuardOutput(stdout) {
-  if (typeof stdout !== "string" || stdout.trim() === "") {
-    throw new Error("guard returned no JSON decision");
+  if (typeof stdout !== "string") {
+    throw new Error("guard output must be text");
+  }
+  if (stdout.trim() === "") {
+    return { decision: "allow", reason: "" };
   }
 
   let parsed;
@@ -188,12 +277,20 @@ function discoverBash(options = {}) {
 function evaluatePreToolUse(event, dependencies = {}) {
   const spawn = dependencies.spawnSync || nodeSpawnSync;
   const hooks = { ...DEFAULT_HOOKS, ...(dependencies.hooks || {}) };
-  let payload;
+  let classification;
   try {
-    payload = mapToolCall(event, dependencies.platform || process.platform);
+    classification = classifyToolCall(event, {
+      platform: dependencies.platform || process.platform,
+      fileSystem: dependencies.fileSystem || fs,
+    });
   } catch (error) {
     return deny(`Governance input rejected: ${error.message}`);
   }
+  if (classification.kind === "allow") return { decision: "allow" };
+  if (classification.kind === "force_ask") {
+    return { decision: "force_ask", reason: classification.reason };
+  }
+  const payload = classification.payload;
 
   const inheritedEnv = { ...process.env, ...(dependencies.env || {}) };
   delete inheritedEnv.BASH_ENV;
@@ -259,6 +356,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  classifyToolCall,
   discoverBash,
   evaluatePreToolUse,
   mapToolCall,

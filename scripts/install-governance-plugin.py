@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -21,12 +22,56 @@ class GovernanceInstallError(RuntimeError):
     """Raised when governance cannot be proven enabled and current."""
 
 
+def component_is_link_or_reparse(path: Path, info: object) -> bool:
+    if stat.S_ISLNK(getattr(info, "st_mode")):
+        return True
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if getattr(info, "st_file_attributes", 0) & reparse_flag:
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction):
+        try:
+            return bool(is_junction())
+        except OSError:
+            return True
+    return False
+
+
+def assert_no_redirect_components(path: Path, label: str) -> None:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    if not absolute.is_absolute():
+        raise GovernanceInstallError(f"{label} must be absolute: {path}")
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            break
+        except OSError as error:
+            raise GovernanceInstallError(
+                f"Cannot inspect {label} component {current}: {error}"
+            ) from error
+        if component_is_link_or_reparse(current, info):
+            raise GovernanceInstallError(
+                f"{label} contains a symlink/junction/reparse component: {current}"
+            )
+
+
 def _load_source_manifest(source: Path) -> dict[str, Any]:
     source = source.absolute()
-    if source.is_symlink() or not source.is_dir():
+    assert_no_redirect_components(source, "Plugin source")
+    if not source.is_dir():
         raise GovernanceInstallError(f"Plugin source must be a regular directory: {source}")
     manifest_path = source / "plugin.json"
-    if manifest_path.is_symlink() or not manifest_path.is_file():
+    assert_no_redirect_components(manifest_path, "Plugin source manifest")
+    try:
+        manifest_info = os.lstat(manifest_path)
+    except OSError as error:
+        raise GovernanceInstallError("Plugin source manifest is missing") from error
+    if component_is_link_or_reparse(manifest_path, manifest_info) or not stat.S_ISREG(
+        manifest_info.st_mode
+    ):
         raise GovernanceInstallError("Plugin source manifest is missing or symlinked")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -80,6 +125,7 @@ def _load_plugin_entries(result: Any) -> list[dict[str, Any]]:
 
 def _regular_tree_files(root_path: Path, label: str) -> list[Path]:
     files: list[Path] = []
+    assert_no_redirect_components(root_path, label)
 
     def walk_failed(error: OSError) -> None:
         raise GovernanceInstallError(f"Cannot inspect {label}: {error}") from error
@@ -89,11 +135,22 @@ def _regular_tree_files(root_path: Path, label: str) -> list[Path]:
     ):
         current_root = Path(root)
         for directory in directories:
-            if (current_root / directory).is_symlink():
-                raise GovernanceInstallError(f"{label} must not contain symlinked directories")
+            candidate = current_root / directory
+            try:
+                info = os.lstat(candidate)
+            except OSError as error:
+                raise GovernanceInstallError(f"Cannot inspect {label}: {candidate}") from error
+            if component_is_link_or_reparse(candidate, info) or not stat.S_ISDIR(info.st_mode):
+                raise GovernanceInstallError(
+                    f"{label} must not contain symlinked/junction/reparse directories"
+                )
         for name in names:
             candidate = current_root / name
-            if candidate.is_symlink() or not candidate.is_file():
+            try:
+                info = os.lstat(candidate)
+            except OSError as error:
+                raise GovernanceInstallError(f"Cannot inspect {label}: {candidate}") from error
+            if component_is_link_or_reparse(candidate, info) or not stat.S_ISREG(info.st_mode):
                 raise GovernanceInstallError(f"{label} must contain only regular files")
             files.append(candidate.relative_to(root_path))
     return sorted(files)
@@ -120,7 +177,8 @@ def verify_current_plugin(source: Path, entries: Sequence[dict[str, Any]]) -> Pa
     if not isinstance(installed_raw, str) or not installed_raw:
         raise GovernanceInstallError("Installed governance plugin path is missing")
     installed = Path(installed_raw).absolute()
-    if installed.is_symlink() or not installed.is_dir():
+    assert_no_redirect_components(installed, "Installed governance plugin")
+    if not installed.is_dir():
         raise GovernanceInstallError("Installed governance plugin path is not a regular directory")
 
     source_files = _regular_tree_files(source, "Plugin source")
@@ -131,7 +189,8 @@ def verify_current_plugin(source: Path, entries: Sequence[dict[str, Any]]) -> Pa
     for relative in source_files:
         source_file = source / relative
         installed_file = installed / relative
-        if installed_file.is_symlink() or not installed_file.is_file():
+        assert_no_redirect_components(installed_file, "Installed governance file")
+        if not installed_file.is_file():
             raise GovernanceInstallError(f"Installed governance file is missing or symlinked: {relative}")
         try:
             if installed_file.read_bytes() != source_file.read_bytes():

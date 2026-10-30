@@ -10,9 +10,9 @@ mode="$(link_or_copy "$generated_context" "$target_context")"
 merge_managed_settings "$(get_gemini_settings_path)"
 ensure_unix_alias "$HOME/.zshrc"
 ensure_unix_alias "$HOME/.bashrc"
-remove_unix_agyx "$HOME/.zshrc"
-remove_unix_agyx "$HOME/.bashrc"
-remove_governance_agyx_wrapper
+expected_agyx_wrapper="$(get_user_bin_dir)/agyx"
+remove_unix_agyx "$HOME/.zshrc" "$expected_agyx_wrapper"
+remove_unix_agyx "$HOME/.bashrc" "$expected_agyx_wrapper"
 infisical_wrapper_repo="$(workspace_path_from_source_map "integrations.infisicalWrapper.repoPath")"
 if [[ -d "$infisical_wrapper_repo" ]]; then
   ensure_infisical_safe_wrapper_shell_wrapper "$infisical_wrapper_repo"
@@ -32,6 +32,7 @@ if [[ -z "$agy_cmd" ]]; then
 fi
 governance_installer="$(dirname "${BASH_SOURCE[0]}")/install-governance-plugin.py"
 governance_plugin="$(get_gemini_dotfiles_root)/plugins/claude-governance"
+remove_governance_agyx_wrapper "$python_cmd" "$governance_installer" "$governance_plugin" "$agy_cmd"
 "$python_cmd" "$governance_installer" --agy "$agy_cmd" --plugin-dir "$governance_plugin"
 agyx_wrapper="$(install_governance_agyx_wrapper "$python_cmd" "$governance_installer" "$governance_plugin" "$agy_cmd")"
 ensure_unix_agyx "$HOME/.zshrc" "$agyx_wrapper"
