@@ -332,6 +332,42 @@ function Ensure-WindowsGemWrapper {
     }
 }
 
+function Remove-GovernanceAgyx {
+    $binDir = Get-UserBinDir
+    foreach ($name in @('agyx.cmd', 'agyx.ps1')) {
+        $candidate = Join-Path $binDir $name
+        if (Test-Path -LiteralPath $candidate) {
+            Remove-Item -LiteralPath $candidate -Force
+        }
+    }
+}
+
+function Install-GovernanceAgyx {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonPath,
+        [Parameter(Mandatory = $true)][string]$InstallerPath,
+        [Parameter(Mandatory = $true)][string]$PluginPath,
+        [Parameter(Mandatory = $true)][string]$AgyPath
+    )
+
+    foreach ($value in @($PythonPath, $InstallerPath, $PluginPath, $AgyPath)) {
+        if ($value -match '[\r\n"%!^&|<>()]') {
+            throw 'Governance wrapper paths contain unsupported cmd.exe metacharacters.'
+        }
+    }
+
+    $binDir = Get-UserBinDir
+    Ensure-Directory -Path $binDir
+    $wrapperPath = Join-Path $binDir 'agyx.cmd'
+    $wrapperContent = @"
+@echo off
+"$PythonPath" "$InstallerPath" --check-only --agy "$AgyPath" --plugin-dir "$PluginPath" >nul
+if errorlevel 1 exit /b %errorlevel%
+"$AgyPath" --dangerously-skip-permissions %*
+"@
+    Set-Content -LiteralPath $wrapperPath -Value $wrapperContent -NoNewline
+}
+
 function Ensure-InfisicalSafeWrapper {
     $wrapperRepo = Get-WorkspacePathFromSourceMap -PathKey 'integrations.infisicalWrapper.repoPath'
     if (-not (Test-Path -LiteralPath $wrapperRepo -PathType Container)) {

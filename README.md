@@ -17,6 +17,8 @@ Claude remains the canonical source of truth. This repo translates the portable 
 - Validated Claude skill snapshots at `~/.gemini/skills/<skill-name>/`
 - Repo onboarding helper for Claude-first projects
 - Shell alias/profile wiring for `gem`
+- Strictly validated and attested `claude-governance` plugin installation
+- Governed `agyx` wrapper exposure only after the plugin is enabled and current
 - Shared `infisical-safe-wrapper` command installation when the sibling repo is present
 
 ## Canonical Sources
@@ -52,6 +54,8 @@ powershell -ExecutionPolicy Bypass -File C:\github\gemini-dotfiles\scripts\boots
 If the sibling repo `~/Desktop/github/infisical-safe-wrapper` exists, bootstrap installs the shared `infisical-safe-wrapper` command into the user bin directory and ensures that directory is on PATH. Installation fails closed unless the sibling checkout is the expected repository, is clean on published `main`, and exposes tracked non-redirecting wrapper entrypoints. The installed launcher pins that reviewed commit and repeats the provenance checks before every invocation; later checkout drift is refused rather than executed.
 
 `source-map.local.json` may relocate the sibling checkout only by changing `integrations.infisicalWrapper.repoPath` to another single repository-name segment under the shared workspace. Absolute paths, traversal, separators, control characters, quotes, symlinks, and Windows reparse redirects are rejected. The expected Git remote remains canonical in the tracked `source-map.json` and cannot be weakened by the local override.
+
+Bootstrap requires Python 3, Node.js, and a working `agy` command. On Windows, command governance also requires Git Bash. Set `GEMINI_GOVERNANCE_BASH` to an existing absolute Bash executable when Git Bash is installed outside its standard locations.
 
 Prepare a repo the first time Gemini CLI should work there:
 
@@ -97,6 +101,16 @@ powershell -ExecutionPolicy Bypass -File C:\github\gemini-dotfiles\scripts\ci\lo
 - `security.environmentVariableRedaction.enabled` is set to `true`
 - `gem` shell shortcut runs `gemini --approval-mode=yolo`
 
+## Governance Plugin
+
+The plugin follows Antigravity's current [hook contract](https://antigravity.google/docs/hooks) and [plugin lifecycle](https://antigravity.google/docs/plugins). Its `PreToolUse` hook covers `view_file`, `write_to_file`, `replace_file_content`, `multi_replace_file_content`, and `run_command`. File paths are mapped from the documented `AbsolutePath` and `TargetFile` fields; command working directories come only from a validated absolute `args.Cwd` inside a declared workspace.
+
+Secret protection is required for every governed tool. Commands additionally require the destructive-command gate and token guard. Missing guards, process failures, timeouts, signals, non-zero exits, malformed JSON, or invalid decision schemas deny the tool call. Session context and synchronization hooks remain best-effort because they do not authorize tool execution.
+
+`agyx` deliberately requests Antigravity's dangerous permission-bypass mode. Bootstrap therefore removes any previously managed `agyx` entry first, validates the plugin with `agy plugin validate --strict`, installs and enables it, and compares Antigravity's installed copy byte-for-byte with this repository before restoring the wrapper. The wrapper repeats that enabled/current attestation every time it runs; if governance cannot be proven, `agyx` fails without launching Antigravity. Bash and PowerShell bootstraps enforce the same sequence.
+
+This control reduces accidental or agent-driven bypass risk but does not make `--dangerously-skip-permissions` intrinsically safe. A user who can alter the local account, executable search path, canonical Claude hooks, or this repository can still subvert local controls. Keep those dependencies reviewed and access-controlled.
+
 ## Safety Rules
 
 - No Claude files are deleted.
@@ -110,6 +124,7 @@ powershell -ExecutionPolicy Bypass -File C:\github\gemini-dotfiles\scripts\ci\lo
 - Plugin cache versions use parsed numeric version ordering with a deterministic lexical fallback; filesystem modification time is never treated as version authority.
 - Invalid skill frontmatter, modified managed snapshots, missing Python, and other parity failures stop bootstrap with a non-zero exit.
 - YOLO mode is only enabled through the shell shortcut, not forced into persistent settings.
+- `agyx` is omitted or fails closed unless the governance plugin is enabled and exactly matches the reviewed repository copy.
 
 ## Files
 
@@ -119,6 +134,8 @@ powershell -ExecutionPolicy Bypass -File C:\github\gemini-dotfiles\scripts\ci\lo
 - `scripts/bootstrap.sh`
 - `scripts/bootstrap.ps1`
 - `scripts/sync-claude-plugins.py`
+- `scripts/install-governance-plugin.py`
+- `plugins/claude-governance/`
 - both bootstrap scripts install the same pinned, provenance-checking `infisical-safe-wrapper` runtime when a clean published sibling checkout is available
 - `scripts/use-project.sh`
 - `scripts/use-project.ps1`

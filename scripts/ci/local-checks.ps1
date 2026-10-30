@@ -37,5 +37,20 @@ if (-not $pythonCommand) {
 if ($LASTEXITCODE -ne 0) { throw "Managed skill sync tests failed with exit code $LASTEXITCODE." }
 Write-Host 'OK  managed skill sync tests'
 
+Write-Host '==> governance plugin tests'
+$nodeCommand = Get-Command node -ErrorAction SilentlyContinue
+if (-not $nodeCommand) {
+    throw 'Node.js is required to validate the governance hooks.'
+}
+& $nodeCommand.Source --check (Join-Path $root 'plugins\claude-governance\scripts\bridge-pretooluse.js')
+if ($LASTEXITCODE -ne 0) { throw "Governance PreToolUse syntax failed with exit code $LASTEXITCODE." }
+& $nodeCommand.Source --check (Join-Path $root 'plugins\claude-governance\scripts\bridge-stop.js')
+if ($LASTEXITCODE -ne 0) { throw "Governance Stop syntax failed with exit code $LASTEXITCODE." }
+& $nodeCommand.Source --test (Join-Path $root 'tests\governance-hooks.test.js')
+if ($LASTEXITCODE -ne 0) { throw "Governance hook tests failed with exit code $LASTEXITCODE." }
+& $pythonCommand.Source (Join-Path $root 'tests\test_governance_install.py') -v
+if ($LASTEXITCODE -ne 0) { throw "Governance install tests failed with exit code $LASTEXITCODE." }
+Write-Host 'OK  governance plugin tests'
+
 Write-Host ''
 Write-Host 'Local CI baseline passed.'

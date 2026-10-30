@@ -252,13 +252,74 @@ ensure_unix_alias() {
   local line
   for line in \
     "alias gem='gemini --approval-mode=yolo'" \
-    "alias agyx='agy --dangerously-skip-permissions'" \
     "alias antigravity='agy'"
   do
     if ! grep -Fqx "$line" "$profile"; then
       printf '\n%s\n' "$line" >> "$profile"
     fi
   done
+}
+
+remove_unix_agyx() {
+  local profile="$1"
+  touch "$profile"
+  local temporary start_count end_count
+  start_count="$(grep -Fxc '# >>> gemini-dotfiles agyx >>>' "$profile" || true)"
+  end_count="$(grep -Fxc '# <<< gemini-dotfiles agyx <<<' "$profile" || true)"
+  if [[ "$start_count" != "$end_count" ]]; then
+    echo "ERROR: Refusing to modify malformed agyx profile block: $profile" >&2
+    return 1
+  fi
+  temporary="$(mktemp "${profile}.agyx.XXXXXX")"
+  if ! awk '
+    /^# >>> gemini-dotfiles agyx >>>$/ { managed=1; next }
+    $0 == "# <<< gemini-dotfiles agyx <<<" { managed=0; next }
+    managed { next }
+    $0 == "alias agyx=\047agy --dangerously-skip-permissions\047" { next }
+    { print }
+  ' "$profile" > "$temporary"; then
+    rm -f "$temporary"
+    return 1
+  fi
+  if ! cat "$temporary" > "$profile"; then
+    rm -f "$temporary"
+    return 1
+  fi
+  rm -f "$temporary"
+}
+
+remove_governance_agyx_wrapper() {
+  rm -f "$(get_user_bin_dir)/agyx"
+}
+
+install_governance_agyx_wrapper() {
+  local python_cmd="${1:?Python command required}"
+  local installer="${2:?governance installer required}"
+  local plugin_dir="${3:?governance plugin directory required}"
+  local agy_cmd="${4:?agy command required}"
+  local wrapper_dir wrapper_path
+  wrapper_dir="$(get_user_bin_dir)"
+  wrapper_path="$wrapper_dir/agyx"
+  mkdir -p "$wrapper_dir"
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf '%q ' "$python_cmd" "$installer" --check-only --agy "$agy_cmd" --plugin-dir "$plugin_dir"
+    printf '>/dev/null\n'
+    printf 'exec %q --dangerously-skip-permissions "$@"\n' "$agy_cmd"
+  } > "$wrapper_path"
+  chmod +x "$wrapper_path"
+  printf '%s\n' "$wrapper_path"
+}
+
+ensure_unix_agyx() {
+  local profile="${1:?profile required}"
+  local wrapper_path="${2:?agyx wrapper required}"
+  remove_unix_agyx "$profile"
+  {
+    printf '\n# >>> gemini-dotfiles agyx >>>\n'
+    printf 'alias agyx=%q\n' "$wrapper_path"
+    printf '# <<< gemini-dotfiles agyx <<<\n'
+  } >> "$profile"
 }
 
 ensure_infisical_safe_wrapper_shell_wrapper() {

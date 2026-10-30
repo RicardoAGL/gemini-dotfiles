@@ -22,7 +22,7 @@ async function main() {
 
   // Run stop syncs
   try {
-    spawnSync("node", [DOTFILES_SYNC_STOP], {
+    spawnSync(process.execPath, [DOTFILES_SYNC_STOP], {
       input: JSON.stringify(agyEvent),
       encoding: "utf8",
       timeout: 15000,
@@ -30,17 +30,18 @@ async function main() {
   } catch {}
 
   try {
-    spawnSync("node", [MEMEX_SYNC_STOP], {
+    spawnSync(process.execPath, [MEMEX_SYNC_STOP], {
       input: JSON.stringify(agyEvent),
       encoding: "utf8",
       timeout: 15000,
     });
   } catch {}
 
-  // Allow stop
-  process.stdout.write("{}\n");
+  // The Antigravity Stop contract requires a decision. Only "continue"
+  // prevents stopping, so "allow" explicitly permits the stop.
+  process.stdout.write('{"decision":"allow"}\n');
 }
 
 main().catch(() => {
-  process.stdout.write("{}\n");
+  process.stdout.write('{"decision":"allow"}\n');
 });

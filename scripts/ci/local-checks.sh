@@ -27,5 +27,16 @@ echo '==> managed skill sync tests'
 PYTHONDONTWRITEBYTECODE=1 python3 "$root/tests/test_sync_claude_plugins.py" -v
 echo 'OK  managed skill sync tests'
 
+echo '==> governance plugin tests'
+if ! command -v node >/dev/null 2>&1; then
+  echo 'ERROR: Node.js is required to validate the governance hooks.' >&2
+  exit 1
+fi
+node --check "$root/plugins/claude-governance/scripts/bridge-pretooluse.js"
+node --check "$root/plugins/claude-governance/scripts/bridge-stop.js"
+node --test "$root/tests/governance-hooks.test.js"
+PYTHONDONTWRITEBYTECODE=1 python3 "$root/tests/test_governance_install.py" -v
+echo 'OK  governance plugin tests'
+
 echo
 echo 'Local CI baseline passed.'
