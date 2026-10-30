@@ -39,22 +39,67 @@ test("PreToolUse matcher covers every tool so unknown tools cannot bypass govern
   assert.equal(hooks["claude-governance"].PreToolUse[0].matcher, "*");
 });
 
-test("all documented read-path tools pass their official path through the secret guard", () => {
+test("read search tools preserve distinct Claude tool types and descendant-sensitive fields", () => {
   const cases = [
-    ["view_file", { AbsolutePath: path.join(root, "README.md") }, path.join(root, "README.md")],
-    ["list_dir", { DirectoryPath: root }, root],
-    ["find_by_name", { SearchDirectory: root, Pattern: "*.md" }, root],
-    ["grep_search", { SearchPath: root, Query: "governance" }, root],
+    [
+      "view_file",
+      { AbsolutePath: path.join(root, "README.md") },
+      "Read",
+      { file_path: path.join(root, "README.md") },
+    ],
+    [
+      "find_by_name",
+      { SearchDirectory: root, Pattern: "**/*.md" },
+      "Glob",
+      { path: root, pattern: "**/*.md" },
+    ],
+    [
+      "grep_search",
+      { SearchPath: root, Query: "secret|token" },
+      "Grep",
+      { path: root, pattern: "secret|token" },
+    ],
   ];
-  for (const [tool, args, expectedPath] of cases) {
+  for (const [tool, args, expectedTool, expectedInput] of cases) {
     const calls = [];
     const result = evaluatePreToolUse(event(tool, args), { spawnSync: allowingSpawn(calls) });
     assert.equal(result.decision, "allow", tool);
     assert.equal(calls.length, 1, tool);
     const payload = JSON.parse(calls[0].options.input);
-    assert.equal(payload.tool_name, "Read", tool);
-    assert.equal(payload.tool_input.file_path, expectedPath, tool);
+    assert.equal(payload.tool_name, expectedTool, tool);
+    assert.deepEqual(payload.tool_input, expectedInput, tool);
   }
+});
+
+test("list_dir forces approval only after physical workspace containment", (t) => {
+  const allowed = evaluatePreToolUse(event("list_dir", { DirectoryPath: path.join(root, "tests") }), {
+    spawnSync: () => assert.fail("list_dir must not run a plain directory guard"),
+  });
+  assert.equal(allowed.decision, "force_ask");
+
+  for (const directory of [path.resolve(root, ".."), path.join(root, "missing-directory")]) {
+    const denied = evaluatePreToolUse(event("list_dir", { DirectoryPath: directory }));
+    assert.equal(denied.decision, "deny", directory);
+  }
+
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "governance-list-"));
+  t.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
+  const workspace = path.join(temporary, "workspace");
+  const outside = path.join(temporary, "outside");
+  const redirect = path.join(workspace, "redirect");
+  fs.mkdirSync(workspace);
+  fs.mkdirSync(outside);
+  try {
+    fs.symlinkSync(outside, redirect, process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    t.skip(`directory redirect unavailable: ${error.message}`);
+    return;
+  }
+  const escaped = evaluatePreToolUse(
+    event("list_dir", { DirectoryPath: redirect }, [workspace])
+  );
+  assert.equal(escaped.decision, "deny");
+  assert.match(escaped.reason, /physical|workspace/i);
 });
 
 test("all documented write tools pass TargetFile through the write secret guard", () => {
