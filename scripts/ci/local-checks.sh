@@ -8,7 +8,7 @@ bash -n "$root/scripts/lib.sh" "$root/scripts/install-gemini-cli.sh" "$root/scri
 echo 'OK  bash syntax'
 
 echo '==> source-map structure'
-python3 - <<PY
+PYTHONDONTWRITEBYTECODE=1 python3 - <<PY
 import json, pathlib
 path = pathlib.Path(r"$root/source-map.json")
 data = json.loads(path.read_text())
@@ -19,7 +19,7 @@ print("OK  source-map structure")
 PY
 
 echo '==> managed skill sync tests'
-python3 "$root/tests/test_sync_claude_plugins.py" -v
+PYTHONDONTWRITEBYTECODE=1 python3 "$root/tests/test_sync_claude_plugins.py" -v
 echo 'OK  managed skill sync tests'
 
 echo
