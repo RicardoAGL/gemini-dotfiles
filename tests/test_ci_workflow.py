@@ -8,7 +8,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
-CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262"
+CHECKOUT_SHA = "d23441a48e516b6c34aea4fa41551a30e30af803"
 
 
 class WorkflowContractTests(unittest.TestCase):

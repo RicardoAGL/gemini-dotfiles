@@ -6,7 +6,17 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$repo_root/scripts/lib.sh"
 
 tmp="$(cd "$(mktemp -d)" && pwd -P)"
-trap 'rm -rf "$tmp"' EXIT
+redirect_native=''
+
+cleanup() {
+  if [[ "${OS:-}" == "Windows_NT" && -n "$redirect_native" ]] && command -v powershell.exe >/dev/null 2>&1; then
+    MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -NonInteractive -Command \
+      'if (Test-Path -LiteralPath $args[0]) { Remove-Item -LiteralPath $args[0] -Force -ErrorAction SilentlyContinue }' \
+      "$redirect_native" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
 
 fail() {
   echo "FAIL: $*" >&2
@@ -64,8 +74,28 @@ python3 "$runtime" --verify-only "$config"
 [[ "$(python3 "$runtime" "$config" hello world)" == 'fixture:hello world' ]] || fail 'verified runtime did not execute fixture'
 echo 'PASS: published checkout is pinned and executable through the verifier'
 
-ln -s "$checkout" "$tmp/redirected-repo"
-python3 - "$config" "$tmp/redirected-repo" <<'PY'
+redirect="$tmp/redirected-repo"
+redirect_created=0
+if [[ "${OS:-}" == "Windows_NT" ]]; then
+  if command -v powershell.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
+    redirect_native="$(cygpath -w "$redirect")"
+    checkout_native="$(cygpath -w "$checkout")"
+    if MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -NonInteractive -Command \
+      '$link = $args[0]; $target = $args[1]; New-Item -ItemType Junction -Path $link -Target $target -ErrorAction Stop | Out-Null' \
+      "$redirect_native" "$checkout_native"; then
+      redirect_created=1
+    fi
+  fi
+  if [[ "$redirect_created" -eq 0 ]]; then
+    echo 'SKIP: Windows junction creation is unavailable; Linux symlink coverage remains active.'
+  fi
+else
+  ln -s "$checkout" "$redirect"
+  redirect_created=1
+fi
+
+if [[ "$redirect_created" -eq 1 ]]; then
+python3 - "$config" "$redirect" <<'PY'
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
 data = json.loads(path.read_text(encoding="utf-8"))
@@ -73,7 +103,12 @@ data["repo"] = sys.argv[2]
 path.write_text(json.dumps(data) + "\n", encoding="utf-8")
 PY
 expect_failure python3 "$runtime" --verify-only "$config"
-unlink "$tmp/redirected-repo"
+if [[ "${OS:-}" == "Windows_NT" ]]; then
+  MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -NonInteractive -Command \
+    'Remove-Item -LiteralPath $args[0] -Force -ErrorAction Stop' "$redirect_native"
+else
+  unlink "$redirect"
+fi
 python3 - "$config" "$checkout" <<'PY'
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
@@ -82,6 +117,7 @@ data["repo"] = sys.argv[2]
 path.write_text(json.dumps(data) + "\n", encoding="utf-8")
 PY
 echo 'PASS: redirecting repository paths fail closed'
+fi
 
 printf '# dirty\n' >> "$checkout/bin/infisical-safe-wrapper.sh"
 expect_failure python3 "$runtime" --verify-only "$config"
@@ -124,11 +160,11 @@ echo 'PASS: installed wrapper rejects post-install mutation and commit drift'
 expect_failure ensure_infisical_safe_wrapper_shell_wrapper "$checkout" "$tmp/other-bin" https://example.invalid/wrong.git
 echo 'PASS: unexpected repository identity fails before installation'
 
-rg -q 'Get-SafeWorkspaceRepoPath' "$repo_root/scripts/lib.ps1" || fail 'PowerShell safe workspace resolver missing'
-rg -q 'infisical-wrapper-runtime.py' "$repo_root/scripts/lib.ps1" || fail 'PowerShell shared runtime integration missing'
-rg -q '%~dp0\\.infisical-safe-wrapper-runtime.py' "$repo_root/scripts/lib.ps1" || fail 'CMD wrapper is not adjacent-path based'
-rg -q 'New-InfisicalCmdContent -PythonPath \$pythonCommand.Source' "$repo_root/scripts/lib.ps1" || fail 'CMD wrapper does not use the validated Python executable'
-rg -q '\$PSScriptRoot' "$repo_root/scripts/lib.ps1" || fail 'PowerShell wrapper is not adjacent-path based'
+grep -Fq 'Get-SafeWorkspaceRepoPath' "$repo_root/scripts/lib.ps1" || fail 'PowerShell safe workspace resolver missing'
+grep -Fq 'infisical-wrapper-runtime.py' "$repo_root/scripts/lib.ps1" || fail 'PowerShell shared runtime integration missing'
+grep -Fq '%~dp0\.infisical-safe-wrapper-runtime.py' "$repo_root/scripts/lib.ps1" || fail 'CMD wrapper is not adjacent-path based'
+grep -Fq 'New-InfisicalCmdContent -PythonPath $pythonCommand.Source' "$repo_root/scripts/lib.ps1" || fail 'CMD wrapper does not use the validated Python executable'
+grep -Fq '$PSScriptRoot' "$repo_root/scripts/lib.ps1" || fail 'PowerShell wrapper is not adjacent-path based'
 echo 'PASS: PowerShell and CMD wrappers share the verified runtime without interpolated checkout paths'
 
 echo 'All Infisical wrapper boundary tests passed.'
