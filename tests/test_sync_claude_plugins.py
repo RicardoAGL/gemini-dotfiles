@@ -231,6 +231,20 @@ class SkillSyncTests(unittest.TestCase):
         self.assertTrue(destination.is_symlink())
         self.assertEqual(os.readlink(destination), os.fspath(attacker_target))
 
+    def test_move_identity_rejects_reused_inode_for_different_object_type(self):
+        original = SimpleNamespace(
+            st_dev=7,
+            st_ino=11,
+            st_mode=self.module.stat.S_IFDIR | 0o700,
+        )
+        replacement = SimpleNamespace(
+            st_dev=7,
+            st_ino=11,
+            st_mode=self.module.stat.S_IFLNK | 0o777,
+        )
+
+        self.assertFalse(self.module.same_path_identity(original, replacement))
+
     def test_move_path_preserves_recreated_source(self):
         source = self.root / "source"
         destination = self.root / "destination"

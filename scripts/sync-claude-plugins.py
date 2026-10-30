@@ -802,6 +802,14 @@ def atomic_move_noreplace(source: Path, destination: Path) -> None:
     )
 
 
+def same_path_identity(source_info: os.stat_result, destination_info: os.stat_result) -> bool:
+    """Compare stable identity fields and reject inode reuse across object types."""
+    return (
+        os.path.samestat(source_info, destination_info)
+        and stat.S_IFMT(source_info.st_mode) == stat.S_IFMT(destination_info.st_mode)
+    )
+
+
 def move_path(source: Path, destination: Path) -> None:
     """Move one owned entry with no-replace and fail-closed identity checks."""
     try:
@@ -822,7 +830,7 @@ def move_path(source: Path, destination: Path) -> None:
         raise SyncError(
             f"Atomic move destination is missing: {destination}"
         ) from error
-    if not os.path.samestat(source_identity, destination_identity):
+    if not same_path_identity(source_identity, destination_identity):
         raise SyncError(
             f"Destination identity changed during atomic move: {destination}"
         )
