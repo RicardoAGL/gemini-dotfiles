@@ -702,10 +702,46 @@ def write_manifest(entries: dict[str, dict[str, str]]) -> None:
             temporary_path.unlink()
 
 
+def normalize_windows_extended_path(value: str) -> str | None:
+    """Normalize validated drive/UNC extended paths and reject device namespaces."""
+    if value.startswith("\\\\?\\UNC\\"):
+        remainder = value[8:]
+        parts = remainder.split("\\")
+        if (
+            "/" in remainder
+            or len(parts) < 2
+            or any(not part or part in {".", ".."} for part in parts)
+        ):
+            return None
+        return "\\\\" + remainder
+    if value.startswith("\\\\?\\"):
+        remainder = value[4:]
+        tail = remainder[3:]
+        if (
+            not re.match(r"^[A-Za-z]:\\", remainder)
+            or "/" in remainder
+            or (
+                tail
+                and any(
+                    not part or part in {".", ".."}
+                    for part in tail.split("\\")
+                )
+            )
+        ):
+            return None
+        return remainder
+    if value.startswith("\\\\.\\") or value.startswith("\\??\\"):
+        return None
+    return value
+
+
 def symlink_target_path(target: Path) -> Path | None:
     if not target.is_symlink():
         return None
-    raw = Path(os.readlink(target))
+    normalized = normalize_windows_extended_path(os.readlink(target))
+    if normalized is None:
+        return None
+    raw = Path(normalized)
     if raw.is_absolute():
         return raw.resolve(strict=False)
     return (target.parent / raw).resolve(strict=False)

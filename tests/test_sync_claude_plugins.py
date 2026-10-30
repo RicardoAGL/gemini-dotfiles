@@ -207,6 +207,43 @@ class SkillSyncTests(unittest.TestCase):
         self.assertTrue(quarantined[0].is_symlink())
         self.assertIn("quarantined stale managed skill: old-branch-skill", output)
 
+    def test_windows_extended_symlink_paths_are_normalized(self):
+        self.assertEqual(
+            self.module.normalize_windows_extended_path(
+                r"\\?\C:\workspace\skills\alpha"
+            ),
+            r"C:\workspace\skills\alpha",
+        )
+        self.assertEqual(
+            self.module.normalize_windows_extended_path(
+                r"\\?\UNC\server\share\skills\alpha"
+            ),
+            r"\\server\share\skills\alpha",
+        )
+        for unsupported in (
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\skills\alpha",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\skills\alpha",
+            r"\\?\C:relative\skills\alpha",
+            r"\\?\C:\workspace\..\foreign\alpha",
+            r"\\?\UNC\server",
+            r"\\.\C:\workspace\skills\alpha",
+            r"\??\C:\workspace\skills\alpha",
+        ):
+            with self.subTest(unsupported=unsupported):
+                self.assertIsNone(
+                    self.module.normalize_windows_extended_path(unsupported)
+                )
+
+        self.target.mkdir()
+        foreign = self.target / "foreign-device-link"
+        foreign.symlink_to(
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\skills\alpha",
+            target_is_directory=True,
+        )
+        self.assertFalse(
+            self.module.is_legacy_canonical_link(foreign, [self.canonical])
+        )
+
     def test_move_path_preserves_substituted_destination(self):
         source = self.root / "source"
         destination = self.root / "destination"
@@ -229,7 +266,10 @@ class SkillSyncTests(unittest.TestCase):
                 self.module.move_path(source, destination)
 
         self.assertTrue(destination.is_symlink())
-        self.assertEqual(os.readlink(destination), os.fspath(attacker_target))
+        self.assertEqual(
+            self.module.symlink_target_path(destination),
+            attacker_target.resolve(strict=False),
+        )
 
     def test_move_identity_rejects_reused_inode_for_different_object_type(self):
         original = SimpleNamespace(
@@ -266,7 +306,10 @@ class SkillSyncTests(unittest.TestCase):
                 self.module.move_path(source, destination)
 
         self.assertTrue(source.is_symlink())
-        self.assertEqual(os.readlink(source), os.fspath(attacker_target))
+        self.assertEqual(
+            self.module.symlink_target_path(source),
+            attacker_target.resolve(strict=False),
+        )
         self.assertTrue(destination.is_dir())
 
     def test_move_path_does_not_replace_existing_destination(self):
