@@ -44,7 +44,7 @@ try {
     Install-GovernanceAgyx @common
     Remove-GovernanceAgyx @common
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $temporary 'agyx.cmd'))) 'Owned agyx.cmd was not removed.'
-    $quarantine = Get-ChildItem -LiteralPath (Join-Path $temporary '.gemini-dotfiles-quarantine') -Filter 'agyx.cmd.*'
+    $quarantine = @(Get-ChildItem -LiteralPath (Join-Path $temporary '.gemini-dotfiles-quarantine') -Filter 'agyx.cmd.*')
     Assert-True ($quarantine.Count -eq 1) 'Owned agyx.cmd was not quarantined exactly once.'
 
     $foreignCmd = Join-Path $temporary 'agyx.cmd'
