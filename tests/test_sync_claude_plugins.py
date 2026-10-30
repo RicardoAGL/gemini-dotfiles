@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -64,7 +65,12 @@ class SkillSyncTests(unittest.TestCase):
         self.module.CLAUDE_PLUGINS_CACHE = self.cache
         self.module.CLAUDE_USER_SKILLS = self.canonical
         self.module.GEMINI_SKILLS_DIR = self.target
-        self.module.get_canonical_skills_dirs = lambda: [self.canonical]
+        self.canonical_revision = "f" * 40
+        self.module.get_canonical_skills_dirs = lambda: [
+            self.module.CanonicalRoot(
+                self.canonical, "canonical", self.canonical_revision
+            )
+        ]
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -96,6 +102,7 @@ class SkillSyncTests(unittest.TestCase):
         entry = self.read_manifest()["entries"]["alpha-skill"]
         self.assertEqual(entry["owner"], "claude-dotfiles-sync")
         self.assertEqual(entry["sourceType"], "canonical")
+        self.assertEqual(entry["sourceRevision"], self.canonical_revision)
         self.assertRegex(entry["sha256"], r"^[0-9a-f]{64}$")
 
     def test_unmanaged_same_name_target_is_preserved_and_sync_fails(self):
@@ -122,7 +129,7 @@ class SkillSyncTests(unittest.TestCase):
 
         self.assertEqual(list(external.iterdir()), [])
 
-    def test_legacy_flat_plugin_export_is_migrated_to_complete_package(self):
+    def test_unowned_flat_plugin_export_is_not_inferred_as_legacy(self):
         self.settings.write_text(
             json.dumps({"enabledPlugins": {"coderlm@test-marketplace": True}}),
             encoding="utf-8",
@@ -141,14 +148,15 @@ class SkillSyncTests(unittest.TestCase):
         legacy.mkdir(parents=True)
         (legacy / "SKILL.md").write_bytes(old_command.read_bytes())
 
-        result, output = self.run_sync()
+        before = (legacy / "SKILL.md").read_bytes()
 
-        self.assertEqual(result, 0)
-        self.assertIn("migrate: coderlm", output)
-        self.assertTrue((legacy / "scripts" / "coderlm_cli.py").is_file())
-        self.assertIn("Complete plugin package", (legacy / "SKILL.md").read_text(encoding="utf-8"))
+        with self.assertRaises(self.module.SyncError):
+            self.run_sync()
 
-    def test_disabled_plugin_legacy_export_is_removed_but_user_skill_remains(self):
+        self.assertEqual((legacy / "SKILL.md").read_bytes(), before)
+        self.assertFalse((legacy / "scripts").exists())
+
+    def test_disabled_plugin_lookalike_is_preserved_as_unmanaged(self):
         version = self.cache / "test-marketplace" / "retired" / "1.0.0"
         (version / "commands").mkdir(parents=True)
         old_command = version / "commands" / "retired.md"
@@ -161,11 +169,11 @@ class SkillSyncTests(unittest.TestCase):
         result, output = self.run_sync()
 
         self.assertEqual(result, 0)
-        self.assertFalse(legacy.exists())
+        self.assertTrue(legacy.exists())
         self.assertTrue(user_skill.is_dir())
-        self.assertIn("removed stale managed skill: retired", output)
+        self.assertNotIn("retired", output)
 
-    def test_broken_legacy_repo_symlink_is_removed(self):
+    def test_broken_legacy_repo_symlink_is_quarantined(self):
         repo_skills = self.root / "repo-skills"
         repo_skills.mkdir()
         self.module.repository_skill_candidates = lambda: [repo_skills]
@@ -177,7 +185,12 @@ class SkillSyncTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertFalse(stale.is_symlink())
-        self.assertIn("removed stale managed skill: old-branch-skill", output)
+        quarantined = list(
+            (self.target / ".claude-sync-quarantine").glob("*/old-branch-skill")
+        )
+        self.assertEqual(len(quarantined), 1)
+        self.assertTrue(quarantined[0].is_symlink())
+        self.assertIn("quarantined stale managed skill: old-branch-skill", output)
 
     def test_managed_skill_refreshes_and_second_identical_run_is_unchanged(self):
         source = write_skill(self.canonical, "refreshable", "Version one.")
@@ -239,8 +252,8 @@ class SkillSyncTests(unittest.TestCase):
         new = self.cache / "test-marketplace" / "versioned" / "2.0.0"
         write_skill(old / "skills", "versioned", "Old plugin version.")
         write_skill(new / "skills", "versioned", "New plugin version.")
-        os.utime(old, ns=(1_000_000_000, 1_000_000_000))
-        os.utime(new, ns=(2_000_000_000, 2_000_000_000))
+        os.utime(old, ns=(2_000_000_000, 2_000_000_000))
+        os.utime(new, ns=(1_000_000_000, 1_000_000_000))
 
         result, _ = self.run_sync()
 
@@ -264,23 +277,146 @@ class SkillSyncTests(unittest.TestCase):
     def test_invalid_manifest_entry_name_fails_without_touching_targets(self):
         self.target.mkdir()
         user_skill = write_skill(self.target, "user-skill", "Unmanaged and preserved.")
-        (self.target / MANIFEST_NAME).write_text(
+        manifest_path = self.target / MANIFEST_NAME
+        manifest_path.write_text(
             json.dumps(
                 {
-                    "schemaVersion": 1,
+                    "schemaVersion": self.module.SCHEMA_VERSION,
                     "owner": "claude-dotfiles-sync",
                     "entries": {"../outside": {"owner": "claude-dotfiles-sync"}},
                 }
             ),
             encoding="utf-8",
         )
+        manifest_path.chmod(0o600)
 
         with self.assertRaises(self.module.SyncError):
             self.run_sync()
 
         self.assertTrue(user_skill.is_dir())
 
-    def test_stale_unmodified_managed_skill_is_removed(self):
+    def test_symlinked_manifest_is_rejected(self):
+        self.target.mkdir()
+        external = self.root / "external-manifest.json"
+        external.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": self.module.SCHEMA_VERSION,
+                    "owner": "claude-dotfiles-sync",
+                    "entries": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (self.target / MANIFEST_NAME).symlink_to(external)
+
+        with self.assertRaises(self.module.SyncError):
+            self.run_sync()
+
+        self.assertTrue((self.target / MANIFEST_NAME).is_symlink())
+
+    def test_manifest_entry_owner_and_hash_are_validated(self):
+        self.target.mkdir()
+        manifest_path = self.target / MANIFEST_NAME
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": self.module.SCHEMA_VERSION,
+                    "owner": "claude-dotfiles-sync",
+                    "entries": {
+                        "claimed": {
+                            "owner": "someone-else",
+                            "sourceType": "canonical",
+                            "source": "/tmp/source",
+                            "sourceRevision": "not-a-revision",
+                            "sha256": "not-a-hash",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        manifest_path.chmod(0o600)
+
+        with self.assertRaises(self.module.SyncError):
+            self.run_sync()
+
+    def test_plugin_identifier_path_traversal_is_rejected(self):
+        for plugin_id in ("../../escape@market", "plugin@../../market", "a@b@c"):
+            with self.subTest(plugin_id=plugin_id):
+                self.settings.write_text(
+                    json.dumps({"enabledPlugins": {plugin_id: True}}),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(self.module.SyncError):
+                    self.module.get_enabled_plugins()
+
+    def test_symlinked_plugin_cache_component_is_rejected(self):
+        external = self.root / "external-cache"
+        write_skill(
+            external / "plugin" / "1.0.0" / "skills", "plugin", "External."
+        )
+        (self.cache / "market").symlink_to(external, target_is_directory=True)
+
+        with self.assertRaises(self.module.SyncError):
+            self.module.select_plugin_version("plugin@market")
+
+    def test_repository_source_requires_clean_published_main(self):
+        repo = self.root / "claude-dotfiles"
+        remote = self.root / "claude-dotfiles.git"
+        subprocess.run(
+            ["git", "init", "--bare", str(remote)], check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "init", "-b", "main", str(repo)], check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Fixture"], cwd=repo, check=True
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "fixture@example.test"],
+            cwd=repo,
+            check=True,
+        )
+        write_skill(repo / "skills", "published", "Published.")
+        subprocess.run(["git", "add", "skills"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "-c", "commit.gpgsign=false", "commit", "-m", "fixture"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "remote", "add", "origin", str(remote)], cwd=repo, check=True
+        )
+        subprocess.run(
+            ["git", "push", "-u", "origin", "main"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+
+        source = self.module.validate_repository_source(
+            repo / "skills", "claude-dotfiles"
+        )
+        self.assertEqual(source.source_type, "canonical")
+        self.assertRegex(source.revision, r"^[0-9a-f]{40}$")
+
+        (repo / "skills" / "published" / "SKILL.md").write_text(
+            "dirty\n", encoding="utf-8"
+        )
+        with self.assertRaises(self.module.SyncError):
+            self.module.validate_repository_source(repo / "skills", "claude-dotfiles")
+
+    def test_deployed_fallback_is_distinct_and_content_attested(self):
+        write_skill(self.canonical, "attested", "Attested fallback.")
+
+        source = self.module.attest_deployed_source(self.canonical)
+
+        self.assertEqual(source.source_type, "deployed-canonical")
+        self.assertRegex(source.revision, r"^sha256:[0-9a-f]{64}$")
+
+    def test_stale_unmodified_managed_skill_is_quarantined(self):
         source = write_skill(self.canonical, "stale-skill", "Will become stale.")
         first_result, _ = self.run_sync()
         self.assertEqual(first_result, 0)
@@ -297,7 +433,18 @@ class SkillSyncTests(unittest.TestCase):
         self.assertEqual(second_result, 0)
         self.assertFalse((self.target / "stale-skill").exists())
         self.assertNotIn("stale-skill", self.read_manifest()["entries"])
-        self.assertIn("removed stale managed skill: stale-skill", second_output)
+        quarantined = list(
+            (self.target / ".claude-sync-quarantine").glob("*/stale-skill")
+        )
+        self.assertEqual(len(quarantined), 1)
+        self.assertTrue(quarantined[0].is_dir())
+        metadata = json.loads(
+            (quarantined[0].parent / "quarantine-manifest.json").read_text()
+        )
+        self.assertEqual(
+            metadata["entries"]["stale-skill"]["reason"], "stale-managed"
+        )
+        self.assertIn("quarantined stale managed skill: stale-skill", second_output)
 
     def test_modified_stale_managed_skill_is_preserved_and_reported(self):
         source = write_skill(self.canonical, "locally-modified", "Managed initially.")
@@ -320,6 +467,106 @@ class SkillSyncTests(unittest.TestCase):
 
         self.assertTrue((self.target / "locally-modified").is_dir())
         self.assertIn("local edit", installed_manifest.read_text(encoding="utf-8"))
+
+    def test_activation_failure_rolls_back_all_prior_changes(self):
+        write_skill(self.canonical, "alpha", "Alpha.")
+        write_skill(self.canonical, "beta", "Beta.")
+        original = self.module.activate_staged_skill
+        calls = 0
+
+        def fail_second(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected activation failure")
+            return original(*args, **kwargs)
+
+        self.module.activate_staged_skill = fail_second
+        with self.assertRaises(OSError):
+            self.run_sync()
+
+        self.assertFalse((self.target / "alpha").exists())
+        self.assertFalse((self.target / "beta").exists())
+        self.assertFalse((self.target / MANIFEST_NAME).exists())
+
+    def test_manifest_failure_rolls_back_refresh_and_quarantine(self):
+        stale_source = write_skill(self.canonical, "stale", "Stale.")
+        refresh_source = write_skill(self.canonical, "refresh", "Version one.")
+        self.run_sync()
+        original_manifest = (self.target / MANIFEST_NAME).read_bytes()
+        original_refresh = (self.target / "refresh" / "SKILL.md").read_bytes()
+        stale_source.rename(self.root / "removed-stale-source")
+        (refresh_source / "SKILL.md").write_text(
+            "---\nname: refresh\ndescription: Version two.\n---\n", encoding="utf-8"
+        )
+
+        def fail_manifest(_entries):
+            raise OSError("injected manifest failure")
+
+        self.module.write_manifest = fail_manifest
+        with self.assertRaises(OSError):
+            self.run_sync()
+
+        self.assertEqual((self.target / MANIFEST_NAME).read_bytes(), original_manifest)
+        self.assertEqual(
+            (self.target / "refresh" / "SKILL.md").read_bytes(), original_refresh
+        )
+        self.assertTrue((self.target / "stale").is_dir())
+        quarantine = self.target / ".claude-sync-quarantine"
+        self.assertFalse(quarantine.exists() and any(quarantine.iterdir()))
+
+    def test_next_run_recovers_an_interrupted_transaction(self):
+        write_skill(self.canonical, "alpha", "Alpha.")
+        write_skill(self.canonical, "beta", "Beta.")
+        original = self.module.activate_staged_skill
+        calls = 0
+
+        def interrupt_second(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise KeyboardInterrupt("injected interruption")
+            return original(*args, **kwargs)
+
+        self.module.activate_staged_skill = interrupt_second
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_sync()
+
+        self.assertTrue((self.target / self.module.TRANSACTION_NAME).is_dir())
+        self.module.activate_staged_skill = original
+        result, _ = self.run_sync()
+
+        self.assertEqual(result, 0)
+        self.assertTrue((self.target / "alpha").is_dir())
+        self.assertTrue((self.target / "beta").is_dir())
+        self.assertFalse((self.target / self.module.TRANSACTION_NAME).exists())
+
+    def test_tampered_transaction_journal_cannot_escape_managed_root(self):
+        external = self.root / "external"
+        external.mkdir()
+        sentinel = external / "sentinel.txt"
+        sentinel.write_text("preserve\n", encoding="utf-8")
+        transaction = self.target / self.module.TRANSACTION_NAME
+        transaction.mkdir(parents=True)
+        journal = transaction / "journal.json"
+        journal.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "manifestExisted": False,
+                    "quarantine": str(external),
+                    "replacements": [],
+                    "stale": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        journal.chmod(0o600)
+
+        with self.assertRaises(self.module.SyncError):
+            self.run_sync()
+
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve\n")
 
 
 if __name__ == "__main__":
