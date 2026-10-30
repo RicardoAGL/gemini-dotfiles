@@ -9,6 +9,7 @@ can update or quarantine only entries this script owns.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
@@ -24,6 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from contextlib import contextmanager
+from ctypes import wintypes
 
 
 OWNER = "claude-dotfiles-sync"
@@ -37,6 +39,11 @@ ATTESTED_REVISION_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 QUARANTINE_NAME = ".claude-sync-quarantine"
 TRANSACTION_NAME = ".claude-sync-transaction"
 LOCK_NAME = ".claude-sync.lock"
+WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+WINDOWS_SYNCHRONIZE = 0x00100000
+WINDOWS_WAIT_OBJECT_0 = 0x00000000
+WINDOWS_WAIT_TIMEOUT = 0x00000102
+WINDOWS_STILL_ACTIVE = 259
 
 
 def configured_path(environment_name: str, default: Path) -> Path:
@@ -113,13 +120,28 @@ def assert_no_symlink_components(path: Path, label: str) -> None:
     for part in absolute.parts[1:]:
         current = current / part
         try:
-            mode = os.lstat(current).st_mode
+            info = os.lstat(current)
         except FileNotFoundError:
             break
         except OSError as error:
             raise SyncError(f"Cannot inspect {label} component {current}: {error}") from error
-        if stat.S_ISLNK(mode):
-            raise SyncError(f"{label} contains a symlink component: {current}")
+        if component_is_link_or_reparse(current, info):
+            raise SyncError(f"{label} contains a symlink/reparse component: {current}")
+
+
+def component_is_link_or_reparse(path: Path, info: object) -> bool:
+    if stat.S_ISLNK(getattr(info, "st_mode")):
+        return True
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if getattr(info, "st_file_attributes", 0) & reparse_flag:
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction):
+        try:
+            return bool(is_junction())
+        except OSError:
+            return True
+    return False
 
 
 def repository_skill_candidates() -> list[Path]:
@@ -779,9 +801,61 @@ def read_lock_owner(lock_path: Path) -> dict:
         raise SyncError(f"Cannot read skill sync lock {lock_path}: {error}") from error
 
 
+def running_on_windows() -> bool:
+    return os.name == "nt"
+
+
+def load_windows_kernel32():
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return kernel32
+
+
+def windows_process_is_active(pid: int) -> bool:
+    try:
+        kernel32 = load_windows_kernel32()
+        handle = kernel32.OpenProcess(
+            WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION | WINDOWS_SYNCHRONIZE,
+            False,
+            pid,
+        )
+    except (AttributeError, OSError):
+        return True
+    if not handle:
+        return True
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        wait_result = kernel32.WaitForSingleObject(handle, 0)
+        if exit_code.value != WINDOWS_STILL_ACTIVE:
+            return False
+        if wait_result == WINDOWS_WAIT_TIMEOUT:
+            return True
+        if wait_result == WINDOWS_WAIT_OBJECT_0:
+            return True
+        return True
+    except (AttributeError, OSError, ValueError):
+        return True
+    finally:
+        try:
+            kernel32.CloseHandle(handle)
+        except (AttributeError, OSError):
+            pass
+
+
 def owner_is_active(owner: dict) -> bool:
     if owner["host"] != socket.gethostname():
         return True
+    if running_on_windows():
+        return windows_process_is_active(owner["pid"])
     try:
         os.kill(owner["pid"], 0)
     except ProcessLookupError:
