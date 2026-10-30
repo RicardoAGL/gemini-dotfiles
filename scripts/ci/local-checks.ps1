@@ -18,6 +18,18 @@ if ($map.integrations.infisicalWrapper.repoPath -ne 'infisical-safe-wrapper') { 
 if ($map.integrations.infisicalWrapper.remoteUrl -ne 'https://github.com/RicardoAGL/infisical-safe-wrapper.git') { throw 'Unexpected infisical wrapper remote.' }
 Write-Host 'OK  source-map structure'
 
+Write-Host '==> GitHub Actions workflow contract'
+$pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+if (-not $pythonCommand) {
+    $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue
+}
+if (-not $pythonCommand) {
+    throw 'Python is required to validate the GitHub Actions workflow.'
+}
+& $pythonCommand.Source (Join-Path $root 'tests\test_ci_workflow.py') -v
+if ($LASTEXITCODE -ne 0) { throw "GitHub Actions workflow contract failed with exit code $LASTEXITCODE." }
+Write-Host 'OK  GitHub Actions workflow contract'
+
 Write-Host '==> Infisical wrapper boundary tests'
 $bashCommand = Get-Command bash -ErrorAction SilentlyContinue
 if (-not $bashCommand) { throw 'Bash is required to run Infisical wrapper boundary tests.' }
@@ -26,13 +38,6 @@ if ($LASTEXITCODE -ne 0) { throw "Infisical wrapper boundary tests failed with e
 Write-Host 'OK  Infisical wrapper boundary tests'
 
 Write-Host '==> managed skill sync tests'
-$pythonCommand = Get-Command python -ErrorAction SilentlyContinue
-if (-not $pythonCommand) {
-    $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue
-}
-if (-not $pythonCommand) {
-    throw 'Python is required to run managed skill sync tests.'
-}
 & $pythonCommand.Source (Join-Path $root 'tests\test_sync_claude_plugins.py') -v
 if ($LASTEXITCODE -ne 0) { throw "Managed skill sync tests failed with exit code $LASTEXITCODE." }
 Write-Host 'OK  managed skill sync tests'

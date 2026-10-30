@@ -19,6 +19,10 @@ assert data["integrations"]["infisicalWrapper"]["remoteUrl"] == "https://github.
 print("OK  source-map structure")
 PY
 
+echo '==> GitHub Actions workflow contract'
+PYTHONDONTWRITEBYTECODE=1 python3 "$root/tests/test_ci_workflow.py" -v
+echo 'OK  GitHub Actions workflow contract'
+
 echo '==> Infisical wrapper boundary tests'
 bash "$root/tests/infisical-wrapper/run-tests.sh"
 echo 'OK  Infisical wrapper boundary tests'
