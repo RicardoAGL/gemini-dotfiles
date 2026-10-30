@@ -356,6 +356,34 @@ class GovernanceInstallTests(unittest.TestCase):
         self.assertEqual(profile.read_text(encoding="utf-8").strip(), "keep-before")
 
     @unittest.skipUnless(shutil.which("bash"), "Bash cleanup test requires Bash")
+    def test_unix_owned_profile_accepts_windows_wrapper_backslashes(self):
+        profile = self.root / "profile"
+        profile.write_text("keep-before\n", encoding="utf-8")
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PROFILE_UNDER_TEST": str(profile),
+                "WRAPPER_UNDER_TEST": r"C:\Users\runner\.local\bin\agyx",
+            }
+        )
+        result = subprocess.run(
+            [
+                shutil.which("bash"),
+                "-c",
+                "source scripts/lib.sh; "
+                'ensure_unix_agyx "$PROFILE_UNDER_TEST" "$WRAPPER_UNDER_TEST"; '
+                'remove_unix_agyx "$PROFILE_UNDER_TEST" "$WRAPPER_UNDER_TEST"',
+            ],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(profile.read_text(encoding="utf-8").strip(), "keep-before")
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash cleanup test requires Bash")
     def test_unix_owned_agyx_wrapper_is_quarantined_not_deleted(self):
         environment = os.environ.copy()
         environment["HOME"] = str(self.root)

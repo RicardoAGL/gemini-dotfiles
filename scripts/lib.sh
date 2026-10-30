@@ -267,7 +267,8 @@ remove_unix_agyx() {
   local temporary expected_alias
   printf -v expected_alias 'alias agyx=%q' "$wrapper_path"
   temporary="$(mktemp "${profile}.agyx.XXXXXX")"
-  if ! awk -v expected_alias="$expected_alias" '
+  if ! AGYX_EXPECTED_ALIAS="$expected_alias" awk '
+    BEGIN { expected_alias = ENVIRON["AGYX_EXPECTED_ALIAS"] }
     $0 == "# >>> gemini-dotfiles agyx >>>" {
       if ((getline alias_line) <= 0 || (getline end_line) <= 0 ||
           alias_line != expected_alias || end_line != "# <<< gemini-dotfiles agyx <<<") {
