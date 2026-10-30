@@ -14,7 +14,50 @@ Write-Host '==> source-map structure'
 $map = Get-Content -Raw (Join-Path $root 'source-map.json') | ConvertFrom-Json
 if ($map.global.contextFileName -ne 'GEMINI.md') { throw 'Unexpected context file name.' }
 if ($map.global.settingsFileName -ne 'settings.json') { throw 'Unexpected settings file name.' }
+if ($map.integrations.infisicalWrapper.repoPath -ne 'infisical-safe-wrapper') { throw 'Unexpected infisical wrapper repo path.' }
+if ($map.integrations.infisicalWrapper.remoteUrl -ne 'https://github.com/RicardoAGL/infisical-safe-wrapper.git') { throw 'Unexpected infisical wrapper remote.' }
 Write-Host 'OK  source-map structure'
+
+Write-Host '==> GitHub Actions workflow contract'
+$pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+if (-not $pythonCommand) {
+    $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue
+}
+if (-not $pythonCommand) {
+    throw 'Python is required to validate the GitHub Actions workflow.'
+}
+& $pythonCommand.Source (Join-Path $root 'tests\test_ci_workflow.py') -v
+if ($LASTEXITCODE -ne 0) { throw "GitHub Actions workflow contract failed with exit code $LASTEXITCODE." }
+Write-Host 'OK  GitHub Actions workflow contract'
+
+Write-Host '==> Infisical wrapper boundary tests'
+$bashCommand = Get-Command bash -ErrorAction SilentlyContinue
+if (-not $bashCommand) { throw 'Bash is required to run Infisical wrapper boundary tests.' }
+& $bashCommand.Source (Join-Path $root 'tests\infisical-wrapper\run-tests.sh')
+if ($LASTEXITCODE -ne 0) { throw "Infisical wrapper boundary tests failed with exit code $LASTEXITCODE." }
+Write-Host 'OK  Infisical wrapper boundary tests'
+
+Write-Host '==> managed skill sync tests'
+& $pythonCommand.Source (Join-Path $root 'tests\test_sync_claude_plugins.py') -v
+if ($LASTEXITCODE -ne 0) { throw "Managed skill sync tests failed with exit code $LASTEXITCODE." }
+Write-Host 'OK  managed skill sync tests'
+
+Write-Host '==> governance plugin tests'
+$nodeCommand = Get-Command node -ErrorAction SilentlyContinue
+if (-not $nodeCommand) {
+    throw 'Node.js is required to validate the governance hooks.'
+}
+& $nodeCommand.Source --check (Join-Path $root 'plugins\claude-governance\scripts\bridge-pretooluse.js')
+if ($LASTEXITCODE -ne 0) { throw "Governance PreToolUse syntax failed with exit code $LASTEXITCODE." }
+& $nodeCommand.Source --check (Join-Path $root 'plugins\claude-governance\scripts\bridge-stop.js')
+if ($LASTEXITCODE -ne 0) { throw "Governance Stop syntax failed with exit code $LASTEXITCODE." }
+& $nodeCommand.Source --test (Join-Path $root 'tests\governance-hooks.test.js')
+if ($LASTEXITCODE -ne 0) { throw "Governance hook tests failed with exit code $LASTEXITCODE." }
+& $pythonCommand.Source (Join-Path $root 'tests\test_governance_install.py') -v
+if ($LASTEXITCODE -ne 0) { throw "Governance install tests failed with exit code $LASTEXITCODE." }
+& (Join-Path $root 'tests\governance-windows.ps1')
+if ($LASTEXITCODE -ne 0) { throw "Governance Windows tests failed with exit code $LASTEXITCODE." }
+Write-Host 'OK  governance plugin tests'
 
 Write-Host ''
 Write-Host 'Local CI baseline passed.'

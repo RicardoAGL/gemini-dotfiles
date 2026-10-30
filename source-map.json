@@ -19,6 +19,11 @@
       "## Process Improvement",
       "## New Project Standards"
     ]
+  },
+  "integrations": {
+    "infisicalWrapper": {
+      "repoPath": "infisical-safe-wrapper",
+      "remoteUrl": "https://github.com/RicardoAGL/infisical-safe-wrapper.git"
+    }
   }
 }
-

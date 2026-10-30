@@ -42,13 +42,48 @@ print(value)
 '
 }
 
+canonical_source_map_value() {
+  local key_path="$1"
+  SOURCE_MAP_PATH="$(get_gemini_dotfiles_root)/source-map.json" \
+  SOURCE_MAP_KEY_PATH="$key_path" \
+  "$(get_python_cmd)" -c '
+import json
+import os
+
+value = json.load(open(os.environ["SOURCE_MAP_PATH"], "r", encoding="utf-8"))
+for part in os.environ["SOURCE_MAP_KEY_PATH"].split("."):
+    value = value[part]
+print(value)
+'
+}
+
+validate_workspace_repo_name() {
+  local repo_name="${1:?repository name required}"
+  if [[ "$repo_name" == "." || "$repo_name" == ".." || ! "$repo_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "Unsafe workspace repository name: $repo_name" >&2
+    return 1
+  fi
+}
+
 get_canonical_repo_path() {
   local repo_name="$1"
   printf '%s/%s\n' "$(get_workspace_root)" "$repo_name"
 }
 
+workspace_path_from_source_map() {
+  local key_path="$1"
+  local repo_name
+  repo_name="$(source_map_value "$key_path")"
+  validate_workspace_repo_name "$repo_name"
+  printf '%s/%s\n' "$(get_workspace_root)" "$repo_name"
+}
+
 ensure_dir() {
   mkdir -p "$1"
+}
+
+get_user_bin_dir() {
+  printf '%s/.local/bin\n' "$HOME"
 }
 
 get_gemini_home() {
@@ -162,7 +197,7 @@ merge_managed_settings() {
   local settings_path="$1"
   ensure_dir "$(dirname "$settings_path")"
   touch "$settings_path"
-  SETTINGS_PATH="$settings_path" "$(get_python_cmd)" - <<'PY'
+  SETTINGS_PATH="$settings_path" "$(get_python_cmd)" -c '
 import json
 import os
 from pathlib import Path
@@ -208,16 +243,215 @@ def merge(base, override):
 
 merged = merge(current, managed)
 path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
-PY
+'
 }
 
 ensure_unix_alias() {
   local profile="$1"
-  local alias_line="alias gem='gemini --approval-mode=yolo'"
   touch "$profile"
-  if ! grep -Fqx "$alias_line" "$profile"; then
-    printf '\n%s\n' "$alias_line" >> "$profile"
+  local line
+  for line in \
+    "alias gem='gemini --approval-mode=yolo'" \
+    "alias antigravity='agy'"
+  do
+    if ! grep -Fqx "$line" "$profile"; then
+      printf '\n%s\n' "$line" >> "$profile"
+    fi
+  done
+}
+
+remove_unix_agyx() {
+  local profile="${1:?profile required}"
+  local wrapper_path="${2:?expected agyx wrapper required}"
+  touch "$profile"
+  local temporary expected_alias
+  printf -v expected_alias 'alias agyx=%q' "$wrapper_path"
+  temporary="$(mktemp "${profile}.agyx.XXXXXX")"
+  if ! AGYX_EXPECTED_ALIAS="$expected_alias" awk '
+    BEGIN { expected_alias = ENVIRON["AGYX_EXPECTED_ALIAS"] }
+    $0 == "# >>> gemini-dotfiles agyx >>>" {
+      if ((getline alias_line) <= 0 || (getline end_line) <= 0 ||
+          alias_line != expected_alias || end_line != "# <<< gemini-dotfiles agyx <<<") {
+        exit 42
+      }
+      next
+    }
+    $0 == "# <<< gemini-dotfiles agyx <<<" { exit 42 }
+    $0 == "alias agyx=\047agy --dangerously-skip-permissions\047" { next }
+    { print }
+  ' "$profile" > "$temporary"; then
+    rm -f "$temporary"
+    echo "ERROR: Refusing to modify unverified agyx profile block: $profile" >&2
+    return 1
   fi
+  if grep -Eq '^[[:space:]]*(alias[[:space:]]+agyx=|function[[:space:]]+agyx([[:space:]]|\{)|agyx[[:space:]]*\(\))' "$temporary"; then
+    rm -f "$temporary"
+    echo "ERROR: Refusing to overwrite foreign agyx profile configuration: $profile" >&2
+    return 1
+  fi
+  if ! cat "$temporary" > "$profile"; then
+    rm -f "$temporary"
+    return 1
+  fi
+  rm -f "$temporary"
+}
+
+render_governance_agyx_wrapper() {
+  local python_cmd="${1:?Python command required}"
+  local installer="${2:?governance installer required}"
+  local plugin_dir="${3:?governance plugin directory required}"
+  local agy_cmd="${4:?agy command required}"
+  printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+  printf '%q ' "$python_cmd" "$installer" --check-only --agy "$agy_cmd" --plugin-dir "$plugin_dir"
+  printf '>/dev/null\n'
+  printf 'exec %q --dangerously-skip-permissions "$@"\n' "$agy_cmd"
+}
+
+quarantine_owned_agyx_wrapper() {
+  local wrapper_path="${1:?wrapper path required}"
+  local quarantine_dir destination timestamp
+  quarantine_dir="$(dirname "$wrapper_path")/.gemini-dotfiles-quarantine"
+  if [[ -L "$quarantine_dir" || ( -e "$quarantine_dir" && ! -d "$quarantine_dir" ) ]]; then
+    echo "ERROR: Invalid agyx quarantine directory: $quarantine_dir" >&2
+    return 1
+  fi
+  mkdir -p "$quarantine_dir"
+  timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+  destination="$quarantine_dir/agyx.$timestamp.$$"
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    echo "ERROR: Refusing to overwrite agyx quarantine entry: $destination" >&2
+    return 1
+  fi
+  mv "$wrapper_path" "$destination"
+}
+
+remove_governance_agyx_wrapper() {
+  local python_cmd="${1:?Python command required}"
+  local installer="${2:?governance installer required}"
+  local plugin_dir="${3:?governance plugin directory required}"
+  local agy_cmd="${4:?agy command required}"
+  local wrapper_path expected
+  wrapper_path="$(get_user_bin_dir)/agyx"
+  if [[ ! -e "$wrapper_path" && ! -L "$wrapper_path" ]]; then
+    return 0
+  fi
+  if [[ -L "$wrapper_path" || ! -f "$wrapper_path" ]]; then
+    echo "ERROR: Refusing to replace foreign agyx wrapper: $wrapper_path" >&2
+    return 1
+  fi
+  expected="$(mktemp "$(dirname "$wrapper_path")/.agyx-expected.XXXXXX")"
+  render_governance_agyx_wrapper "$python_cmd" "$installer" "$plugin_dir" "$agy_cmd" > "$expected"
+  if ! cmp -s "$expected" "$wrapper_path"; then
+    rm -f "$expected"
+    echo "ERROR: Refusing to replace unverified agyx wrapper: $wrapper_path" >&2
+    return 1
+  fi
+  rm -f "$expected"
+  quarantine_owned_agyx_wrapper "$wrapper_path"
+}
+
+install_governance_agyx_wrapper() {
+  local python_cmd="${1:?Python command required}"
+  local installer="${2:?governance installer required}"
+  local plugin_dir="${3:?governance plugin directory required}"
+  local agy_cmd="${4:?agy command required}"
+  local wrapper_dir wrapper_path
+  wrapper_dir="$(get_user_bin_dir)"
+  wrapper_path="$wrapper_dir/agyx"
+  mkdir -p "$wrapper_dir"
+  if [[ -e "$wrapper_path" || -L "$wrapper_path" ]]; then
+    echo "ERROR: Refusing to overwrite existing agyx wrapper: $wrapper_path" >&2
+    return 1
+  fi
+  local temporary
+  temporary="$(mktemp "$wrapper_dir/.agyx-install.XXXXXX")"
+  render_governance_agyx_wrapper "$python_cmd" "$installer" "$plugin_dir" "$agy_cmd" > "$temporary"
+  chmod +x "$temporary"
+  mv "$temporary" "$wrapper_path"
+  printf '%s\n' "$wrapper_path"
+}
+
+ensure_unix_agyx() {
+  local profile="${1:?profile required}"
+  local wrapper_path="${2:?agyx wrapper required}"
+  remove_unix_agyx "$profile" "$wrapper_path"
+  {
+    printf '\n# >>> gemini-dotfiles agyx >>>\n'
+    printf 'alias agyx=%q\n' "$wrapper_path"
+    printf '# <<< gemini-dotfiles agyx <<<\n'
+  } >> "$profile"
+}
+
+ensure_infisical_safe_wrapper_shell_wrapper() {
+  local wrapper_repo="$1"
+  local wrapper_dir="${2:-$(get_user_bin_dir)}"
+  local expected_remote="${3:-$(canonical_source_map_value "integrations.infisicalWrapper.remoteUrl")}"
+  local runtime_source runtime_path config_path wrapper_path commit python_cmd
+  local runtime_tmp config_tmp wrapper_tmp
+
+  runtime_source="$(get_gemini_dotfiles_root)/scripts/integrations/infisical-wrapper-runtime.py"
+  runtime_path="$wrapper_dir/.infisical-safe-wrapper-runtime.py"
+  config_path="$wrapper_dir/.infisical-safe-wrapper.json"
+  wrapper_path="$wrapper_dir/infisical-safe-wrapper"
+  mkdir -p "$wrapper_dir"
+  python_cmd="$(get_python_cmd)"
+  commit="$(git -C "$wrapper_repo" rev-parse HEAD 2>/dev/null)" || {
+    echo "Refusing infisical-safe-wrapper install: checkout is not a valid Git repository." >&2
+    return 1
+  }
+  runtime_tmp="$(mktemp "$wrapper_dir/.infisical-safe-wrapper-runtime.py.tmp.XXXXXX")"
+  config_tmp="$(mktemp "$wrapper_dir/.infisical-safe-wrapper.json.tmp.XXXXXX")"
+  wrapper_tmp="$(mktemp "$wrapper_dir/infisical-safe-wrapper.tmp.XXXXXX")"
+  trap 'rm -f "${runtime_tmp:-}" "${config_tmp:-}" "${wrapper_tmp:-}"' RETURN
+  cp "$runtime_source" "$runtime_tmp"
+  chmod 755 "$runtime_tmp"
+  CONFIG_PATH="$config_tmp" WRAPPER_REPO="$wrapper_repo" EXPECTED_REMOTE="$expected_remote" EXPECTED_COMMIT="$commit" \
+    "$python_cmd" -c '
+import json, os, pathlib
+config = {
+    "schemaVersion": 1,
+    "repo": os.environ["WRAPPER_REPO"],
+    "expectedRemote": os.environ["EXPECTED_REMOTE"],
+    "expectedCommit": os.environ["EXPECTED_COMMIT"],
+    "entrypoint": "bin/infisical-safe-wrapper.sh",
+    "executor": "bash",
+}
+pathlib.Path(os.environ["CONFIG_PATH"]).write_text(json.dumps(config, sort_keys=True) + "\n", encoding="utf-8")
+'
+  chmod 600 "$config_tmp"
+  if ! "$python_cmd" "$runtime_tmp" --verify-only "$config_tmp"; then
+    echo "Refusing infisical-safe-wrapper install: provenance verification failed." >&2
+    return 1
+  fi
+  cat > "$wrapper_tmp" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+wrapper_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+if command -v python3 >/dev/null 2>&1; then
+  python_cmd=python3
+else
+  python_cmd=python
+fi
+exec "$python_cmd" "$wrapper_dir/.infisical-safe-wrapper-runtime.py" "$wrapper_dir/.infisical-safe-wrapper.json" "$@"
+EOF
+  chmod 755 "$wrapper_tmp"
+  mv -f "$runtime_tmp" "$runtime_path"
+  mv -f "$config_tmp" "$config_path"
+  mv -f "$wrapper_tmp" "$wrapper_path"
+  trap - RETURN
+  ensure_user_bin_on_unix_path
+  echo "Installed infisical-safe-wrapper shell wrapper in $wrapper_dir"
+}
+
+ensure_user_bin_on_unix_path() {
+  local profile line
+  line='export PATH="$HOME/.local/bin:$PATH"'
+  for profile in "$HOME/.zshrc" "$HOME/.bashrc"; do
+    touch "$profile"
+    if ! grep -Fqx "$line" "$profile"; then
+      printf '\n%s\n' "$line" >> "$profile"
+    fi
+  done
 }
 
 write_project_gemini_wrapper() {
@@ -241,4 +475,3 @@ write_project_gemini_wrapper() {
 
   printf '%s\n' "$target"
 }
-
