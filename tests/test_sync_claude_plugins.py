@@ -13,6 +13,7 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -52,7 +53,7 @@ def write_skill(
 class SkillSyncTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp_dir.name)
+        self.root = Path(self.temp_dir.name).resolve()
         self.canonical = self.root / "canonical-skills"
         self.cache = self.root / "plugin-cache"
         self.target = self.root / "gemini-skills"
@@ -71,6 +72,7 @@ class SkillSyncTests(unittest.TestCase):
                 self.canonical, "canonical", self.canonical_revision
             )
         ]
+        self.module.revalidate_canonical_sources = lambda _roots: None
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -567,6 +569,124 @@ class SkillSyncTests(unittest.TestCase):
             self.run_sync()
 
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve\n")
+
+    def test_configured_paths_preserve_and_reject_symlinked_components(self):
+        external = self.root / "external-config"
+        external.mkdir()
+        linked_parent = self.root / "linked-parent"
+        linked_parent.symlink_to(external, target_is_directory=True)
+        lexical_target = linked_parent / "gemini-skills"
+        lexical_cache = linked_parent / "plugin-cache"
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GEMINI_SYNC_TARGET": str(lexical_target),
+                "GEMINI_SYNC_PLUGIN_CACHE": str(lexical_cache),
+            },
+        ):
+            imported = load_sync_module()
+
+        self.assertEqual(imported.GEMINI_SKILLS_DIR, lexical_target)
+        self.assertEqual(imported.CLAUDE_PLUGINS_CACHE, lexical_cache)
+        with self.assertRaises(imported.SyncError):
+            with imported.exclusive_sync_lock():
+                pass
+        with self.assertRaises(imported.SyncError):
+            imported.plugin_roots("plugin@market")
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_active_lock_prevents_recovery_by_second_sync(self):
+        with self.module.exclusive_sync_lock():
+            transaction = self.target / self.module.TRANSACTION_NAME
+            transaction.mkdir()
+            sentinel = transaction / "active-owner.txt"
+            sentinel.write_text("preserve\n", encoding="utf-8")
+
+            with self.assertRaises(self.module.SyncError):
+                self.run_sync()
+
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve\n")
+
+    def test_recovery_preserves_unexpected_current_target_and_backup(self):
+        source = write_skill(self.canonical, "refresh", "Version one.")
+        self.run_sync()
+        (source / "SKILL.md").write_text(
+            "---\nname: refresh\ndescription: Version two.\n---\n", encoding="utf-8"
+        )
+        original_write_manifest = self.module.write_manifest
+
+        def interrupt_manifest(_entries):
+            raise KeyboardInterrupt("injected interruption")
+
+        self.module.write_manifest = interrupt_manifest
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_sync()
+        target_manifest = self.target / "refresh" / "SKILL.md"
+        target_manifest.write_text(
+            target_manifest.read_text(encoding="utf-8") + "unexpected\n",
+            encoding="utf-8",
+        )
+        self.module.write_manifest = original_write_manifest
+
+        with self.assertRaises(self.module.SyncError):
+            self.run_sync()
+
+        self.assertIn("unexpected", target_manifest.read_text(encoding="utf-8"))
+        transaction = self.target / self.module.TRANSACTION_NAME
+        self.assertTrue((transaction / "backups" / "refresh").is_dir())
+        self.assertTrue((transaction / "journal.json").is_file())
+
+    def test_recovery_refuses_to_overwrite_unexpected_manifest(self):
+        source = write_skill(self.canonical, "refresh", "Version one.")
+        self.run_sync()
+        (source / "SKILL.md").write_text(
+            "---\nname: refresh\ndescription: Version two.\n---\n", encoding="utf-8"
+        )
+        original_write_manifest = self.module.write_manifest
+
+        def interrupt_manifest(_entries):
+            raise KeyboardInterrupt("injected interruption")
+
+        self.module.write_manifest = interrupt_manifest
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_sync()
+        manifest = self.target / MANIFEST_NAME
+        unexpected = b'{"unexpected": true}\n'
+        manifest.write_bytes(unexpected)
+        manifest.chmod(0o600)
+        self.module.write_manifest = original_write_manifest
+
+        with self.assertRaises(self.module.SyncError):
+            self.run_sync()
+
+        self.assertEqual(manifest.read_bytes(), unexpected)
+        transaction = self.target / self.module.TRANSACTION_NAME
+        self.assertTrue((transaction / "manifest.backup").is_file())
+        self.assertTrue((transaction / "journal.json").is_file())
+
+    def test_canonical_source_is_revalidated_after_staging_before_activation(self):
+        write_skill(self.canonical, "alpha", "Alpha.")
+        original_stage = self.module.stage_skill
+        staged = False
+
+        def record_stage(*args, **kwargs):
+            nonlocal staged
+            original_stage(*args, **kwargs)
+            staged = True
+
+        def reject_changed_source(_roots):
+            self.assertTrue(staged)
+            raise self.module.SyncError("canonical source changed after staging")
+
+        self.module.stage_skill = record_stage
+        self.module.revalidate_canonical_sources = reject_changed_source
+
+        with self.assertRaises(self.module.SyncError):
+            self.run_sync()
+
+        self.assertFalse((self.target / "alpha").exists())
+        self.assertFalse((self.target / self.module.TRANSACTION_NAME).exists())
 
 
 if __name__ == "__main__":
