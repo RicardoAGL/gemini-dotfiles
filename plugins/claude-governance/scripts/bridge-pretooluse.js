@@ -69,6 +69,19 @@ function validateWorkspaces(event, platform, fileSystem) {
   );
 }
 
+function requireContainedDirectory(value, fieldName, workspaces, platform, fileSystem) {
+  const directory = requireDirectory(value, fieldName, platform, fileSystem);
+  const contained = workspaces.some(
+    (workspace) =>
+      pathIsWithin(directory.lexical, workspace.lexical, platform) &&
+      pathIsWithin(directory.physical, workspace.physical, platform)
+  );
+  if (!contained) {
+    throw new Error(`${fieldName} must stay physically within a declared workspace`);
+  }
+  return directory;
+}
+
 function classifyToolCall(event, options = {}) {
   const platform = options.platform || process.platform;
   const fileSystem = options.fileSystem || fs;
@@ -89,16 +102,33 @@ function classifyToolCall(event, options = {}) {
       toolInput = { file_path: requireAbsolutePath(args.AbsolutePath, "AbsolutePath", platform) };
       break;
     case "list_dir":
-      toolName = "Read";
-      toolInput = { file_path: requireAbsolutePath(args.DirectoryPath, "DirectoryPath", platform) };
-      break;
+      requireContainedDirectory(
+        args.DirectoryPath,
+        "DirectoryPath",
+        workspaces,
+        platform,
+        fileSystem
+      );
+      return { kind: "force_ask", reason: "Directory enumeration requires approval" };
     case "find_by_name":
-      toolName = "Read";
-      toolInput = { file_path: requireAbsolutePath(args.SearchDirectory, "SearchDirectory", platform) };
+      if (typeof args.Pattern !== "string" || args.Pattern.length === 0 || args.Pattern.includes("\0")) {
+        throw new Error("Pattern must be a non-empty string");
+      }
+      toolName = "Glob";
+      toolInput = {
+        path: requireAbsolutePath(args.SearchDirectory, "SearchDirectory", platform),
+        pattern: args.Pattern,
+      };
       break;
     case "grep_search":
-      toolName = "Read";
-      toolInput = { file_path: requireAbsolutePath(args.SearchPath, "SearchPath", platform) };
+      if (typeof args.Query !== "string" || args.Query.length === 0 || args.Query.includes("\0")) {
+        throw new Error("Query must be a non-empty string");
+      }
+      toolName = "Grep";
+      toolInput = {
+        path: requireAbsolutePath(args.SearchPath, "SearchPath", platform),
+        pattern: args.Query,
+      };
       break;
     case "write_to_file":
       toolName = "Write";
@@ -127,15 +157,13 @@ function classifyToolCall(event, options = {}) {
         throw new Error("CommandLine must be a non-empty string");
       }
       {
-        const commandDirectory = requireDirectory(args.Cwd, "Cwd", platform, fileSystem);
-        const contained = workspaces.some(
-          (workspace) =>
-            pathIsWithin(commandDirectory.lexical, workspace.lexical, platform) &&
-            pathIsWithin(commandDirectory.physical, workspace.physical, platform)
+        const commandDirectory = requireContainedDirectory(
+          args.Cwd,
+          "Cwd",
+          workspaces,
+          platform,
+          fileSystem
         );
-        if (!contained) {
-          throw new Error("Cwd must stay physically within a declared workspace");
-        }
         cwd = commandDirectory.physical;
       }
       toolName = "Bash";
