@@ -127,6 +127,7 @@ echo 'PASS: unexpected repository identity fails before installation'
 rg -q 'Get-SafeWorkspaceRepoPath' "$repo_root/scripts/lib.ps1" || fail 'PowerShell safe workspace resolver missing'
 rg -q 'infisical-wrapper-runtime.py' "$repo_root/scripts/lib.ps1" || fail 'PowerShell shared runtime integration missing'
 rg -q '%~dp0\\.infisical-safe-wrapper-runtime.py' "$repo_root/scripts/lib.ps1" || fail 'CMD wrapper is not adjacent-path based'
+rg -q 'New-InfisicalCmdContent -PythonPath \$pythonCommand.Source' "$repo_root/scripts/lib.ps1" || fail 'CMD wrapper does not use the validated Python executable'
 rg -q '\$PSScriptRoot' "$repo_root/scripts/lib.ps1" || fail 'PowerShell wrapper is not adjacent-path based'
 echo 'PASS: PowerShell and CMD wrappers share the verified runtime without interpolated checkout paths'
 

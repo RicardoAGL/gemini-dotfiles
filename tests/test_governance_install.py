@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -140,6 +141,74 @@ class GovernanceInstallTests(unittest.TestCase):
         with self.assertRaises(module.GovernanceInstallError):
             module.verify_current_plugin(self.source, [entry])
 
+    def test_attestation_rejects_redirects_in_parent_components(self):
+        module = load_installer()
+        redirected_parent = self.root / "redirected-parent"
+        try:
+            os.symlink(self.root, redirected_parent, target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"directory symlink unavailable: {error}")
+
+        entry = {
+            "name": "claude-governance",
+            "enabled": True,
+            "version": "1.0.0",
+            "path": str(self.installed),
+            "hooks": ["claude-governance"],
+        }
+        with self.assertRaises(module.GovernanceInstallError):
+            module.verify_current_plugin(redirected_parent / "source", [entry])
+
+        entry["path"] = str(redirected_parent / "installed")
+        with self.assertRaises(module.GovernanceInstallError):
+            module.verify_current_plugin(self.source, [entry])
+
+    def test_attestation_rejects_mocked_windows_reparse_components(self):
+        module = load_installer()
+        reparse_flag = getattr(module.stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        component = self.root / "reparse-component"
+        component.mkdir()
+        original_lstat = module.os.lstat
+
+        def lstat_with_reparse(path):
+            result = original_lstat(path)
+            if Path(path) == component:
+                return SimpleNamespace(
+                    st_mode=result.st_mode,
+                    st_file_attributes=reparse_flag,
+                )
+            return result
+
+        with mock.patch.object(module.os, "lstat", side_effect=lstat_with_reparse):
+            with self.assertRaises(module.GovernanceInstallError):
+                module.assert_no_redirect_components(
+                    component / "plugin", "mocked Windows plugin path"
+                )
+
+    def test_attestation_reparse_helper_honors_path_is_junction(self):
+        module = load_installer()
+        candidate = mock.Mock()
+        candidate.is_junction.return_value = True
+        info = SimpleNamespace(st_mode=module.stat.S_IFDIR, st_file_attributes=0)
+        self.assertTrue(module.component_is_link_or_reparse(candidate, info))
+
+    @unittest.skipUnless(os.name == "nt", "real junction test requires Windows")
+    def test_attestation_rejects_real_windows_junction(self):
+        module = load_installer()
+        external = self.root / "junction-external"
+        junction = self.root / "junction"
+        external.mkdir()
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(junction), str(external)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            self.skipTest(f"junction creation unavailable: {result.stderr.strip()}")
+        with self.assertRaises(module.GovernanceInstallError):
+            module.assert_no_redirect_components(junction / "plugin", "real junction")
+
     def test_install_rejects_malformed_plugin_list_and_spawn_errors(self):
         module = load_installer()
 
@@ -161,8 +230,14 @@ class GovernanceInstallTests(unittest.TestCase):
         powershell = (ROOT / "scripts" / "bootstrap.ps1").read_text(encoding="utf-8")
         self.assertLess(bash.index("remove_unix_agyx"), bash.index("install-governance-plugin.py"))
         self.assertLess(bash.index("install-governance-plugin.py"), bash.index("ensure_unix_agyx"))
-        self.assertLess(powershell.index("Remove-GovernanceAgyx"), powershell.index("install-governance-plugin.py"))
-        self.assertLess(powershell.index("install-governance-plugin.py"), powershell.index("Install-GovernanceAgyx"))
+        self.assertLess(
+            powershell.index("Remove-GovernanceAgyx @agyxParameters"),
+            powershell.index("& $pythonCommand.Source $governanceInstaller"),
+        )
+        self.assertLess(
+            powershell.index("& $pythonCommand.Source $governanceInstaller"),
+            powershell.index("Install-GovernanceAgyx @agyxParameters"),
+        )
         self.assertIn("--check-only", (ROOT / "scripts" / "lib.sh").read_text(encoding="utf-8"))
         self.assertIn("--check-only", (ROOT / "scripts" / "lib.ps1").read_text(encoding="utf-8"))
 
@@ -172,12 +247,18 @@ class GovernanceInstallTests(unittest.TestCase):
         original = "# >>> gemini-dotfiles agyx >>>\nkeep-me\n"
         profile.write_text(original, encoding="utf-8")
         environment = os.environ.copy()
-        environment.update({"HOME": str(self.root), "PROFILE_UNDER_TEST": str(profile)})
+        environment.update(
+            {
+                "HOME": str(self.root),
+                "PROFILE_UNDER_TEST": str(profile),
+                "WRAPPER_UNDER_TEST": str(self.root / ".local" / "bin" / "agyx"),
+            }
+        )
         result = subprocess.run(
             [
                 shutil.which("bash"),
                 "-c",
-                'source scripts/lib.sh; remove_unix_agyx "$PROFILE_UNDER_TEST"',
+                'source scripts/lib.sh; remove_unix_agyx "$PROFILE_UNDER_TEST" "$WRAPPER_UNDER_TEST"',
             ],
             cwd=ROOT,
             env=environment,
@@ -187,6 +268,125 @@ class GovernanceInstallTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(profile.read_text(encoding="utf-8"), original)
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash cleanup test requires Bash")
+    def test_unix_agyx_cleanup_preserves_foreign_marker_and_wrapper_collisions(self):
+        profile = self.root / "profile"
+        expected_wrapper = self.root / ".local" / "bin" / "agyx"
+        foreign_profile = (
+            "# >>> gemini-dotfiles agyx >>>\n"
+            "alias agyx=/foreign/agyx\n"
+            "# <<< gemini-dotfiles agyx <<<\n"
+        )
+        profile.write_text(foreign_profile, encoding="utf-8")
+        expected_wrapper.parent.mkdir(parents=True)
+        expected_wrapper.write_text("foreign wrapper\n", encoding="utf-8")
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "HOME": str(self.root),
+                "PROFILE_UNDER_TEST": str(profile),
+                "WRAPPER_UNDER_TEST": str(expected_wrapper),
+            }
+        )
+
+        profile_result = subprocess.run(
+            [
+                shutil.which("bash"),
+                "-c",
+                'source scripts/lib.sh; remove_unix_agyx "$PROFILE_UNDER_TEST" "$WRAPPER_UNDER_TEST"',
+            ],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(profile_result.returncode, 0)
+        self.assertEqual(profile.read_text(encoding="utf-8"), foreign_profile)
+
+        wrapper_result = subprocess.run(
+            [
+                shutil.which("bash"),
+                "-c",
+                "source scripts/lib.sh; "
+                "remove_governance_agyx_wrapper python3 /installer.py /plugin /agy",
+            ],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(wrapper_result.returncode, 0)
+        self.assertEqual(expected_wrapper.read_text(encoding="utf-8"), "foreign wrapper\n")
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash cleanup test requires Bash")
+    def test_unix_exact_legacy_and_current_profile_entries_are_reconciled(self):
+        profile = self.root / "profile"
+        wrapper = self.root / ".local" / "bin" / "agyx"
+        profile.write_text(
+            "keep-before\nalias agyx='agy --dangerously-skip-permissions'\n",
+            encoding="utf-8",
+        )
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "HOME": str(self.root),
+                "PROFILE_UNDER_TEST": str(profile),
+                "WRAPPER_UNDER_TEST": str(wrapper),
+            }
+        )
+        result = subprocess.run(
+            [
+                shutil.which("bash"),
+                "-c",
+                "source scripts/lib.sh; "
+                'remove_unix_agyx "$PROFILE_UNDER_TEST" "$WRAPPER_UNDER_TEST"; '
+                'ensure_unix_agyx "$PROFILE_UNDER_TEST" "$WRAPPER_UNDER_TEST"; '
+                'remove_unix_agyx "$PROFILE_UNDER_TEST" "$WRAPPER_UNDER_TEST"',
+            ],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(profile.read_text(encoding="utf-8").strip(), "keep-before")
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash cleanup test requires Bash")
+    def test_unix_owned_agyx_wrapper_is_quarantined_not_deleted(self):
+        environment = os.environ.copy()
+        environment["HOME"] = str(self.root)
+        result = subprocess.run(
+            [
+                shutil.which("bash"),
+                "-c",
+                "source scripts/lib.sh; "
+                "install_governance_agyx_wrapper python3 /installer.py /plugin /agy >/dev/null; "
+                "remove_governance_agyx_wrapper python3 /installer.py /plugin /agy",
+            ],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        wrapper = self.root / ".local" / "bin" / "agyx"
+        self.assertFalse(wrapper.exists())
+        quarantined = list(
+            (wrapper.parent / ".gemini-dotfiles-quarantine").glob("agyx.*")
+        )
+        self.assertEqual(len(quarantined), 1)
+        self.assertIn("--check-only", quarantined[0].read_text(encoding="utf-8"))
+
+    def test_windows_sources_preserve_unmanaged_ps1_and_use_selected_python(self):
+        powershell = (ROOT / "scripts" / "lib.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("foreach ($name in @('agyx.cmd', 'agyx.ps1'))", powershell)
+        self.assertIn("Resolve-PythonCommand", powershell)
+        self.assertIn("New-InfisicalCmdContent", powershell)
 
 
 if __name__ == "__main__":

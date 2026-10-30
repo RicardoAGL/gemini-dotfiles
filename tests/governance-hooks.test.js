@@ -3,89 +3,88 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const root = path.resolve(__dirname, "..");
-const bridgePath = path.join(
-  root,
-  "plugins",
-  "claude-governance",
-  "scripts",
-  "bridge-pretooluse.js"
-);
-const stopPath = path.join(
-  root,
-  "plugins",
-  "claude-governance",
-  "scripts",
-  "bridge-stop.js"
-);
+const bridgePath = path.join(root, "plugins", "claude-governance", "scripts", "bridge-pretooluse.js");
+const stopPath = path.join(root, "plugins", "claude-governance", "scripts", "bridge-stop.js");
 const { evaluatePreToolUse, discoverBash } = require(bridgePath);
 
-const workspace = path.resolve(root, "fixture-workspace");
-
-function event(name, args) {
+function event(name, args, workspacePaths = [root]) {
   return {
     conversationId: "00000000-0000-0000-0000-000000000001",
-    workspacePaths: [workspace],
+    workspacePaths,
     toolCall: { name, args },
     stepIdx: 1,
   };
 }
 
-function allowingSpawn(calls) {
+function processResult(stdout = "{}\n") {
+  return { status: 0, signal: null, stdout, stderr: "" };
+}
+
+function allowingSpawn(calls, stdout = "{}\n") {
   return (command, args, options) => {
     calls.push({ command, args, options });
-    return { status: 0, signal: null, stdout: "{}\n", stderr: "" };
+    return processResult(stdout);
   };
 }
 
-test("hooks matcher uses the current official tool names", () => {
+test("PreToolUse matcher covers every tool so unknown tools cannot bypass governance", () => {
   const hooks = JSON.parse(
-    fs.readFileSync(
-      path.join(root, "plugins", "claude-governance", "hooks.json"),
-      "utf8"
-    )
+    fs.readFileSync(path.join(root, "plugins", "claude-governance", "hooks.json"), "utf8")
   );
-  assert.equal(
-    hooks["claude-governance"].PreToolUse[0].matcher,
-    "run_command|view_file|write_to_file|replace_file_content|multi_replace_file_content"
-  );
+  assert.equal(hooks["claude-governance"].PreToolUse[0].matcher, "*");
 });
 
-test("official file tools map AbsolutePath and TargetFile into Claude guard payloads", () => {
+test("all documented read-path tools pass their official path through the secret guard", () => {
   const cases = [
-    ["view_file", { AbsolutePath: path.join(workspace, "a.txt") }, "Read"],
-    ["write_to_file", { TargetFile: path.join(workspace, "b.txt"), CodeContent: "x" }, "Write"],
+    ["view_file", { AbsolutePath: path.join(root, "README.md") }, path.join(root, "README.md")],
+    ["list_dir", { DirectoryPath: root }, root],
+    ["find_by_name", { SearchDirectory: root, Pattern: "*.md" }, root],
+    ["grep_search", { SearchPath: root, Query: "governance" }, root],
+  ];
+  for (const [tool, args, expectedPath] of cases) {
+    const calls = [];
+    const result = evaluatePreToolUse(event(tool, args), { spawnSync: allowingSpawn(calls) });
+    assert.equal(result.decision, "allow", tool);
+    assert.equal(calls.length, 1, tool);
+    const payload = JSON.parse(calls[0].options.input);
+    assert.equal(payload.tool_name, "Read", tool);
+    assert.equal(payload.tool_input.file_path, expectedPath, tool);
+  }
+});
+
+test("all documented write tools pass TargetFile through the write secret guard", () => {
+  const cases = [
+    ["write_to_file", { TargetFile: path.join(root, "new.txt"), CodeContent: "x" }, "Write"],
     [
       "replace_file_content",
-      { TargetFile: path.join(workspace, "c.txt"), TargetContent: "a", ReplacementContent: "b" },
+      { TargetFile: path.join(root, "README.md"), TargetContent: "a", ReplacementContent: "b" },
       "Edit",
     ],
     [
       "multi_replace_file_content",
-      { TargetFile: path.join(workspace, "d.txt"), ReplacementChunks: [] },
+      { TargetFile: path.join(root, "README.md"), ReplacementChunks: [] },
       "Edit",
     ],
   ];
   for (const [tool, args, expectedClaudeTool] of cases) {
     const calls = [];
-    const result = evaluatePreToolUse(event(tool, args), {
-      spawnSync: allowingSpawn(calls),
-      bash: "/bin/bash",
-    });
+    const result = evaluatePreToolUse(event(tool, args), { spawnSync: allowingSpawn(calls) });
     assert.equal(result.decision, "allow", tool);
     assert.equal(calls.length, 1, tool);
     const payload = JSON.parse(calls[0].options.input);
     assert.equal(payload.tool_name, expectedClaudeTool, tool);
-    assert.equal(payload.tool_input.file_path, args.AbsolutePath || args.TargetFile, tool);
+    assert.equal(payload.tool_input.file_path, args.TargetFile, tool);
   }
 });
 
-test("run_command uses validated args.Cwd and invokes all required guards", () => {
+test("run_command uses existing physical Cwd and invokes all required guards", () => {
   const calls = [];
-  const cwd = path.join(workspace, "subdir");
+  const cwd = path.join(root, "tests");
   const result = evaluatePreToolUse(
     event("run_command", { CommandLine: "npm test", Cwd: cwd }),
     { spawnSync: allowingSpawn(calls), bash: "/portable/bash" }
@@ -95,28 +94,148 @@ test("run_command uses validated args.Cwd and invokes all required guards", () =
   const payload = JSON.parse(calls[0].options.input);
   assert.equal(payload.tool_name, "Bash");
   assert.equal(payload.tool_input.command, "npm test");
-  assert.equal(payload.cwd, cwd);
+  assert.equal(payload.cwd, fs.realpathSync(cwd));
   assert.equal(calls[1].command, "/portable/bash");
 });
 
-test("run_command rejects a missing, relative, or out-of-workspace Cwd", () => {
-  for (const cwd of [undefined, "relative", path.resolve(workspace, "..", "escape")]) {
+test("run_command rejects missing, relative, nonexistent, and out-of-workspace directories", () => {
+  const outside = path.resolve(root, "..");
+  const missing = path.join(root, "tests", "does-not-exist");
+  const cases = [
+    [undefined, [root]],
+    ["relative", [root]],
+    [missing, [root]],
+    [outside, [root]],
+    [path.join(root, "tests"), [missing]],
+  ];
+  for (const [cwd, workspaces] of cases) {
     const result = evaluatePreToolUse(
-      event("run_command", { CommandLine: "npm test", Cwd: cwd }),
+      event("run_command", { CommandLine: "npm test", Cwd: cwd }, workspaces),
       { spawnSync: allowingSpawn([]), bash: "/bin/bash" }
     );
-    assert.equal(result.decision, "deny");
+    assert.equal(result.decision, "deny", String(cwd));
   }
 });
 
-test("required guards fail closed for process and schema failures", () => {
+test("run_command rejects a physical symlink or junction escape", (t) => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "governance-cwd-"));
+  t.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
+  const workspace = path.join(temporary, "workspace");
+  const outside = path.join(temporary, "outside");
+  const redirect = path.join(workspace, "redirect");
+  fs.mkdirSync(workspace);
+  fs.mkdirSync(outside);
+  try {
+    fs.symlinkSync(outside, redirect, process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    t.skip(`directory redirect unavailable: ${error.message}`);
+    return;
+  }
+  const result = evaluatePreToolUse(
+    event("run_command", { CommandLine: "pwd", Cwd: redirect }, [workspace]),
+    { spawnSync: allowingSpawn([]), bash: "/bin/bash" }
+  );
+  assert.equal(result.decision, "deny");
+  assert.match(result.reason, /physical|workspace/i);
+});
+
+test("mocked Windows junction escape is rejected by physical containment", () => {
+  const fileSystem = {
+    statSync: () => ({ isDirectory: () => true }),
+    realpathSync: (value) => ({
+      "C:\\workspace": "C:\\workspace",
+      "C:\\workspace\\junction": "C:\\outside",
+    })[value],
+  };
+  const result = evaluatePreToolUse(
+    event(
+      "run_command",
+      { CommandLine: "dir", Cwd: "C:\\workspace\\junction" },
+      ["C:\\workspace"]
+    ),
+    {
+      platform: "win32",
+      fileSystem,
+      spawnSync: allowingSpawn([]),
+      bash: "C:\\Git\\bin\\bash.exe",
+    }
+  );
+  assert.equal(result.decision, "deny");
+  assert.match(result.reason, /physical|workspace/i);
+});
+
+test("only explicitly safe documented operations bypass executable guards", () => {
+  const safe = [
+    ["manage_task", { Action: "list" }],
+    ["manage_task", { Action: "status", TaskId: "1" }],
+    ["list_permissions", {}],
+    ["manage_subagents", { Action: "list" }],
+    ["ask_question", { questions: [] }],
+  ];
+  for (const [tool, args] of safe) {
+    const result = evaluatePreToolUse(event(tool, args), {
+      spawnSync: () => assert.fail(`${tool} unexpectedly invoked a process`),
+    });
+    assert.deepEqual(result, { decision: "allow" }, tool);
+  }
+});
+
+test("network, media, permission, subagent, and autonomous mutations force approval", () => {
+  const sensitive = [
+    ["search_web", { query: "security" }],
+    ["read_url_content", { Url: "https://example.invalid" }],
+    ["manage_task", { Action: "kill", TaskId: "1" }],
+    ["manage_task", { Action: "send_input", TaskId: "1", Input: "yes" }],
+    ["schedule", { DurationSeconds: 60, Prompt: "continue" }],
+    ["ask_permission", { Action: "read", Target: "/tmp", Reason: "test" }],
+    ["invoke_subagent", { Subagents: [] }],
+    ["define_subagent", { name: "agent", description: "test", system_prompt: "test" }],
+    ["send_message", { Recipient: "agent", Message: "test" }],
+    ["manage_subagents", { Action: "kill", ConversationIds: ["1"] }],
+    ["manage_subagents", { Action: "kill_all" }],
+    ["generate_image", { Prompt: "test", ImageName: "test.png" }],
+  ];
+  for (const [tool, args] of sensitive) {
+    const result = evaluatePreToolUse(event(tool, args), {
+      spawnSync: () => assert.fail(`${tool} unexpectedly invoked a process`),
+    });
+    assert.equal(result.decision, "force_ask", tool);
+  }
+});
+
+test("unknown tools and invalid enumerated actions deny by default", () => {
+  for (const [tool, args] of [
+    ["future_tool", {}],
+    ["manage_task", { Action: "future" }],
+    ["manage_subagents", { Action: "future" }],
+  ]) {
+    const result = evaluatePreToolUse(event(tool, args), { spawnSync: allowingSpawn([]) });
+    assert.equal(result.decision, "deny", tool);
+  }
+});
+
+test("clean exit zero with empty stdout is allow, but nonempty invalid output denies", () => {
+  const allowed = evaluatePreToolUse(
+    event("view_file", { AbsolutePath: path.join(root, "README.md") }),
+    { spawnSync: allowingSpawn([], "") }
+  );
+  assert.equal(allowed.decision, "allow");
+
+  for (const stdout of ["not json", "[]", '{"unexpected":true}']) {
+    const denied = evaluatePreToolUse(
+      event("view_file", { AbsolutePath: path.join(root, "README.md") }),
+      { spawnSync: () => processResult(stdout) }
+    );
+    assert.equal(denied.decision, "deny", stdout);
+  }
+});
+
+test("required guards fail closed for process and decision failures", () => {
   const failures = [
     { error: Object.assign(new Error("missing"), { code: "ENOENT" }), status: null, stdout: "", stderr: "" },
     { error: Object.assign(new Error("timeout"), { code: "ETIMEDOUT" }), status: null, stdout: "", stderr: "" },
     { status: null, signal: "SIGTERM", stdout: "", stderr: "" },
-    { status: 7, signal: null, stdout: "{}", stderr: "failed" },
-    { status: 0, signal: null, stdout: "not json", stderr: "" },
-    { status: 0, signal: null, stdout: "[]", stderr: "" },
+    { status: 7, signal: null, stdout: "", stderr: "failed" },
     {
       status: 0,
       signal: null,
@@ -126,8 +245,8 @@ test("required guards fail closed for process and schema failures", () => {
   ];
   for (const failure of failures) {
     const result = evaluatePreToolUse(
-      event("view_file", { AbsolutePath: path.join(workspace, "a.txt") }),
-      { spawnSync: () => failure, bash: "/bin/bash" }
+      event("view_file", { AbsolutePath: path.join(root, "README.md") }),
+      { spawnSync: () => failure }
     );
     assert.equal(result.decision, "deny");
   }
@@ -143,15 +262,10 @@ test("each required run_command guard fails closed independently", () => {
   for (const failingGuard of [0, 1, 2]) {
     let call = 0;
     const result = evaluatePreToolUse(
-      event("run_command", { CommandLine: "npm test", Cwd: workspace }),
+      event("run_command", { CommandLine: "npm test", Cwd: path.join(root, "tests") }),
       {
         bash: "/portable/bash",
-        spawnSync: () => (call++ === failingGuard ? blocked : {
-          status: 0,
-          signal: null,
-          stdout: "{}",
-          stderr: "",
-        }),
+        spawnSync: () => (call++ === failingGuard ? blocked : processResult()),
       }
     );
     assert.equal(result.decision, "deny", `guard ${failingGuard}`);
@@ -160,13 +274,11 @@ test("each required run_command guard fails closed independently", () => {
 
 test("run_command fails closed when no trusted Bash can be discovered", () => {
   const result = evaluatePreToolUse(
-    event("run_command", { CommandLine: "npm test", Cwd: workspace }),
+    event("run_command", { CommandLine: "npm test", Cwd: path.join(root, "tests") }),
     {
       platform: "linux",
       existsSync: () => false,
-      spawnSync: (command) => command === process.execPath
-        ? { status: 0, signal: null, stdout: "{}", stderr: "" }
-        : { status: 1, signal: null, stdout: "", stderr: "" },
+      spawnSync: (command) => command === process.execPath ? processResult() : { status: 1, signal: null, stdout: "", stderr: "" },
     }
   );
   assert.equal(result.decision, "deny");

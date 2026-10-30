@@ -50,6 +50,8 @@ if ($LASTEXITCODE -ne 0) { throw "Governance Stop syntax failed with exit code $
 if ($LASTEXITCODE -ne 0) { throw "Governance hook tests failed with exit code $LASTEXITCODE." }
 & $pythonCommand.Source (Join-Path $root 'tests\test_governance_install.py') -v
 if ($LASTEXITCODE -ne 0) { throw "Governance install tests failed with exit code $LASTEXITCODE." }
+& (Join-Path $root 'tests\governance-windows.ps1')
+if ($LASTEXITCODE -ne 0) { throw "Governance Windows tests failed with exit code $LASTEXITCODE." }
 Write-Host 'OK  governance plugin tests'
 
 Write-Host ''
