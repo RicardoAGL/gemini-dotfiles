@@ -42,6 +42,29 @@ print(value)
 '
 }
 
+canonical_source_map_value() {
+  local key_path="$1"
+  SOURCE_MAP_PATH="$(get_gemini_dotfiles_root)/source-map.json" \
+  SOURCE_MAP_KEY_PATH="$key_path" \
+  "$(get_python_cmd)" -c '
+import json
+import os
+
+value = json.load(open(os.environ["SOURCE_MAP_PATH"], "r", encoding="utf-8"))
+for part in os.environ["SOURCE_MAP_KEY_PATH"].split("."):
+    value = value[part]
+print(value)
+'
+}
+
+validate_workspace_repo_name() {
+  local repo_name="${1:?repository name required}"
+  if [[ "$repo_name" == "." || "$repo_name" == ".." || ! "$repo_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "Unsafe workspace repository name: $repo_name" >&2
+    return 1
+  fi
+}
+
 get_canonical_repo_path() {
   local repo_name="$1"
   printf '%s/%s\n' "$(get_workspace_root)" "$repo_name"
@@ -49,7 +72,10 @@ get_canonical_repo_path() {
 
 workspace_path_from_source_map() {
   local key_path="$1"
-  printf '%s/%s\n' "$(get_workspace_root)" "$(source_map_value "$key_path")"
+  local repo_name
+  repo_name="$(source_map_value "$key_path")"
+  validate_workspace_repo_name "$repo_name"
+  printf '%s/%s\n' "$(get_workspace_root)" "$repo_name"
 }
 
 ensure_dir() {
@@ -237,24 +263,74 @@ ensure_unix_alias() {
 
 ensure_infisical_safe_wrapper_shell_wrapper() {
   local wrapper_repo="$1"
-  local repo_wrapper="$wrapper_repo/bin/infisical-safe-wrapper.sh"
-  local wrapper_dir wrapper_path
+  local wrapper_dir="${2:-$(get_user_bin_dir)}"
+  local expected_remote="${3:-$(canonical_source_map_value "integrations.infisicalWrapper.remoteUrl")}"
+  local runtime_source runtime_path config_path wrapper_path commit python_cmd
+  local runtime_tmp config_tmp wrapper_tmp
 
-  if [[ ! -f "$repo_wrapper" ]]; then
-    echo "Skipping infisical-safe-wrapper install because entrypoint is missing: $repo_wrapper"
-    return 0
-  fi
-
-  wrapper_dir="$(get_user_bin_dir)"
+  runtime_source="$(get_gemini_dotfiles_root)/scripts/integrations/infisical-wrapper-runtime.py"
+  runtime_path="$wrapper_dir/.infisical-safe-wrapper-runtime.py"
+  config_path="$wrapper_dir/.infisical-safe-wrapper.json"
   wrapper_path="$wrapper_dir/infisical-safe-wrapper"
   mkdir -p "$wrapper_dir"
-  cat > "$wrapper_path" <<EOF
+  python_cmd="$(get_python_cmd)"
+  commit="$(git -C "$wrapper_repo" rev-parse HEAD 2>/dev/null)" || {
+    echo "Refusing infisical-safe-wrapper install: checkout is not a valid Git repository." >&2
+    return 1
+  }
+  runtime_tmp="$(mktemp "$wrapper_dir/.infisical-safe-wrapper-runtime.py.tmp.XXXXXX")"
+  config_tmp="$(mktemp "$wrapper_dir/.infisical-safe-wrapper.json.tmp.XXXXXX")"
+  wrapper_tmp="$(mktemp "$wrapper_dir/infisical-safe-wrapper.tmp.XXXXXX")"
+  trap 'rm -f "${runtime_tmp:-}" "${config_tmp:-}" "${wrapper_tmp:-}"' RETURN
+  cp "$runtime_source" "$runtime_tmp"
+  chmod 755 "$runtime_tmp"
+  CONFIG_PATH="$config_tmp" WRAPPER_REPO="$wrapper_repo" EXPECTED_REMOTE="$expected_remote" EXPECTED_COMMIT="$commit" \
+    "$python_cmd" -c '
+import json, os, pathlib
+config = {
+    "schemaVersion": 1,
+    "repo": os.environ["WRAPPER_REPO"],
+    "expectedRemote": os.environ["EXPECTED_REMOTE"],
+    "expectedCommit": os.environ["EXPECTED_COMMIT"],
+    "entrypoint": "bin/infisical-safe-wrapper.sh",
+    "executor": "bash",
+}
+pathlib.Path(os.environ["CONFIG_PATH"]).write_text(json.dumps(config, sort_keys=True) + "\n", encoding="utf-8")
+'
+  chmod 600 "$config_tmp"
+  if ! "$python_cmd" "$runtime_tmp" --verify-only "$config_tmp"; then
+    echo "Refusing infisical-safe-wrapper install: provenance verification failed." >&2
+    return 1
+  fi
+  cat > "$wrapper_tmp" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-exec bash "$repo_wrapper" "\$@"
+wrapper_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+if command -v python3 >/dev/null 2>&1; then
+  python_cmd=python3
+else
+  python_cmd=python
+fi
+exec "$python_cmd" "$wrapper_dir/.infisical-safe-wrapper-runtime.py" "$wrapper_dir/.infisical-safe-wrapper.json" "$@"
 EOF
-  chmod +x "$wrapper_path"
+  chmod 755 "$wrapper_tmp"
+  mv -f "$runtime_tmp" "$runtime_path"
+  mv -f "$config_tmp" "$config_path"
+  mv -f "$wrapper_tmp" "$wrapper_path"
+  trap - RETURN
+  ensure_user_bin_on_unix_path
   echo "Installed infisical-safe-wrapper shell wrapper in $wrapper_dir"
+}
+
+ensure_user_bin_on_unix_path() {
+  local profile line
+  line='export PATH="$HOME/.local/bin:$PATH"'
+  for profile in "$HOME/.zshrc" "$HOME/.bashrc"; do
+    touch "$profile"
+    if ! grep -Fqx "$line" "$profile"; then
+      printf '\n%s\n' "$line" >> "$profile"
+    fi
+  done
 }
 
 write_project_gemini_wrapper() {

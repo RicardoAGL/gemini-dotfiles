@@ -22,7 +22,8 @@
   },
   "integrations": {
     "infisicalWrapper": {
-      "repoPath": "infisical-safe-wrapper"
+      "repoPath": "infisical-safe-wrapper",
+      "remoteUrl": "https://github.com/RicardoAGL/infisical-safe-wrapper.git"
     }
   }
 }

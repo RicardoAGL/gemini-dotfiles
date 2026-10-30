@@ -16,6 +16,11 @@ function Get-SourceMap {
     return Get-Content -Raw $basePath | ConvertFrom-Json
 }
 
+function Get-CanonicalSourceMap {
+    $path = Join-Path (Get-GeminiDotfilesRoot) 'source-map.json'
+    return Get-Content -Raw $path | ConvertFrom-Json
+}
+
 function ConvertTo-PlainHashtable {
     param([Parameter(Mandatory = $true)]$Value)
 
@@ -60,6 +65,15 @@ function Get-SourceMapValue {
     return [string]$value
 }
 
+function Get-CanonicalSourceMapValue {
+    param([Parameter(Mandatory = $true)][string]$PathKey)
+    $value = Get-CanonicalSourceMap
+    foreach ($part in ($PathKey -split '\.')) {
+        $value = $value.$part
+    }
+    return [string]$value
+}
+
 function Get-GeminiHome {
     return Join-Path $HOME (Get-SourceMapValue -PathKey 'global.geminiHomeDirName')
 }
@@ -84,7 +98,43 @@ function Get-CanonicalRepoPath {
 
 function Get-WorkspacePathFromSourceMap {
     param([Parameter(Mandatory = $true)][string]$PathKey)
-    return Join-Path (Get-WorkspaceRoot) (Get-SourceMapValue -PathKey $PathKey)
+    return Get-SafeWorkspaceRepoPath -Name (Get-SourceMapValue -PathKey $PathKey)
+}
+
+function Assert-SafeWorkspaceRepoName {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    if ($Name -in @('.', '..') -or $Name -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+        throw "Unsafe workspace repository name: $Name"
+    }
+}
+
+function Assert-NoReparseComponents {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $root = [System.IO.Path]::GetPathRoot($fullPath)
+    $relative = $fullPath.Substring($root.Length)
+    $current = $root
+    foreach ($part in ($relative -split '[\\/]' | Where-Object { $_ })) {
+        $current = Join-Path $current $part
+        if (-not (Test-Path -LiteralPath $current)) { continue }
+        $item = Get-Item -LiteralPath $current -Force
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Redirecting path component is not allowed: $current"
+        }
+    }
+}
+
+function Get-SafeWorkspaceRepoPath {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    Assert-SafeWorkspaceRepoName -Name $Name
+    $workspace = [System.IO.Path]::GetFullPath((Get-WorkspaceRoot)).TrimEnd('\', '/')
+    $candidate = [System.IO.Path]::GetFullPath((Join-Path $workspace $Name))
+    $prefix = $workspace + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $candidate.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Repository path escapes the workspace: $candidate"
+    }
+    Assert-NoReparseComponents -Path $candidate
+    return $candidate
 }
 
 function Get-UserBinDir {
@@ -284,21 +334,63 @@ function Ensure-WindowsGemWrapper {
 
 function Ensure-InfisicalSafeWrapper {
     $wrapperRepo = Get-WorkspacePathFromSourceMap -PathKey 'integrations.infisicalWrapper.repoPath'
-    $repoWrapper = Join-Path $wrapperRepo 'bin\infisical-safe-wrapper.ps1'
-    if (-not (Test-Path -LiteralPath $repoWrapper)) {
-        Write-Host "Skipping infisical-safe-wrapper install because entrypoint is missing: $repoWrapper"
+    if (-not (Test-Path -LiteralPath $wrapperRepo -PathType Container)) {
+        Write-Host "Skipping infisical-safe-wrapper install because repo is missing: $wrapperRepo"
         return
     }
-
     $binDir = Get-UserBinDir
     Ensure-Directory -Path $binDir
-
+    $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $pythonCommand) { $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue }
+    if (-not $pythonCommand) { throw 'Python is required to install infisical-safe-wrapper.' }
+    $expectedRemote = Get-CanonicalSourceMapValue -PathKey 'integrations.infisicalWrapper.remoteUrl'
+    $commit = (& git -C $wrapperRepo rev-parse HEAD 2>$null).Trim()
+    if ($LASTEXITCODE -ne 0 -or $commit -cnotmatch '^[0-9a-f]{40}$') {
+        throw 'Refusing infisical-safe-wrapper install: checkout is not a valid Git repository.'
+    }
+    $runtimeSource = Join-Path (Get-GeminiDotfilesRoot) 'scripts\integrations\infisical-wrapper-runtime.py'
+    $runtimePath = Join-Path $binDir '.infisical-safe-wrapper-runtime.py'
+    $configPath = Join-Path $binDir '.infisical-safe-wrapper.json'
     $cmdPath = Join-Path $binDir 'infisical-safe-wrapper.cmd'
     $ps1Path = Join-Path $binDir 'infisical-safe-wrapper.ps1'
-    $cmdContent = "@echo off`r`npowershell -ExecutionPolicy Bypass -File ""$repoWrapper"" %*`r`n"
-    $ps1Content = "& '$repoWrapper' @args`r`n"
-    Set-Content -LiteralPath $cmdPath -Value $cmdContent -NoNewline
-    Set-Content -LiteralPath $ps1Path -Value $ps1Content -NoNewline
+    $suffix = [Guid]::NewGuid().ToString('N')
+    $runtimeTemp = "$runtimePath.tmp.$suffix"
+    $configTemp = "$configPath.tmp.$suffix"
+    $cmdTemp = "$cmdPath.tmp.$suffix"
+    $ps1Temp = "$ps1Path.tmp.$suffix"
+    try {
+        Copy-Item -LiteralPath $runtimeSource -Destination $runtimeTemp
+        $config = [ordered]@{
+            schemaVersion = 1
+            repo = $wrapperRepo
+            expectedRemote = $expectedRemote
+            expectedCommit = $commit
+            entrypoint = 'bin/infisical-safe-wrapper.ps1'
+            executor = 'powershell'
+        }
+        Set-Content -LiteralPath $configTemp -Value (($config | ConvertTo-Json -Compress) + "`n") -NoNewline
+        & $pythonCommand.Source $runtimeTemp --verify-only $configTemp
+        if ($LASTEXITCODE -ne 0) { throw 'Infisical wrapper provenance verification failed.' }
+        $cmdContent = "@echo off`r`npython ""%~dp0\.infisical-safe-wrapper-runtime.py"" ""%~dp0\.infisical-safe-wrapper.json"" %*`r`n"
+        $ps1Content = @'
+$pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+if (-not $pythonCommand) { $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue }
+if (-not $pythonCommand) { throw 'Python is required to run infisical-safe-wrapper.' }
+& $pythonCommand.Source (Join-Path $PSScriptRoot '.infisical-safe-wrapper-runtime.py') (Join-Path $PSScriptRoot '.infisical-safe-wrapper.json') @args
+exit $LASTEXITCODE
+'@
+        Set-Content -LiteralPath $cmdTemp -Value $cmdContent -NoNewline
+        Set-Content -LiteralPath $ps1Temp -Value $ps1Content -NoNewline
+        Move-Item -Force -LiteralPath $runtimeTemp -Destination $runtimePath
+        Move-Item -Force -LiteralPath $configTemp -Destination $configPath
+        Move-Item -Force -LiteralPath $cmdTemp -Destination $cmdPath
+        Move-Item -Force -LiteralPath $ps1Temp -Destination $ps1Path
+    }
+    finally {
+        foreach ($temporary in @($runtimeTemp, $configTemp, $cmdTemp, $ps1Temp)) {
+            if (Test-Path -LiteralPath $temporary) { Remove-Item -Force -LiteralPath $temporary }
+        }
+    }
 
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $binDirNormalized = $binDir.TrimEnd('\')

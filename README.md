@@ -49,7 +49,9 @@ bash scripts/bootstrap.sh
 powershell -ExecutionPolicy Bypass -File C:\github\gemini-dotfiles\scripts\bootstrap.ps1
 ```
 
-If the sibling repo `~/Desktop/github/infisical-safe-wrapper` exists, bootstrap also installs the shared `infisical-safe-wrapper` command on PATH so Gemini CLI can call the same secret-safe runtime as the other agents.
+If the sibling repo `~/Desktop/github/infisical-safe-wrapper` exists, bootstrap installs the shared `infisical-safe-wrapper` command into the user bin directory and ensures that directory is on PATH. Installation fails closed unless the sibling checkout is the expected repository, is clean on published `main`, and exposes tracked non-redirecting wrapper entrypoints. The installed launcher pins that reviewed commit and repeats the provenance checks before every invocation; later checkout drift is refused rather than executed.
+
+`source-map.local.json` may relocate the sibling checkout only by changing `integrations.infisicalWrapper.repoPath` to another single repository-name segment under the shared workspace. Absolute paths, traversal, separators, control characters, quotes, symlinks, and Windows reparse redirects are rejected. The expected Git remote remains canonical in the tracked `source-map.json` and cannot be weakened by the local override.
 
 Prepare a repo the first time Gemini CLI should work there:
 
@@ -117,6 +119,6 @@ powershell -ExecutionPolicy Bypass -File C:\github\gemini-dotfiles\scripts\ci\lo
 - `scripts/bootstrap.sh`
 - `scripts/bootstrap.ps1`
 - `scripts/sync-claude-plugins.py`
-- both bootstrap scripts also install the shared `infisical-safe-wrapper` wrapper when available
+- both bootstrap scripts install the same pinned, provenance-checking `infisical-safe-wrapper` runtime when a clean published sibling checkout is available
 - `scripts/use-project.sh`
 - `scripts/use-project.ps1`
