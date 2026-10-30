@@ -17,5 +17,17 @@ if ($map.global.settingsFileName -ne 'settings.json') { throw 'Unexpected settin
 if ($map.integrations.infisicalWrapper.repoPath -ne 'infisical-safe-wrapper') { throw 'Unexpected infisical wrapper repo path.' }
 Write-Host 'OK  source-map structure'
 
+Write-Host '==> managed skill sync tests'
+$pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+if (-not $pythonCommand) {
+    $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue
+}
+if (-not $pythonCommand) {
+    throw 'Python is required to run managed skill sync tests.'
+}
+& $pythonCommand.Source (Join-Path $root 'tests\test_sync_claude_plugins.py') -v
+if ($LASTEXITCODE -ne 0) { throw "Managed skill sync tests failed with exit code $LASTEXITCODE." }
+Write-Host 'OK  managed skill sync tests'
+
 Write-Host ''
 Write-Host 'Local CI baseline passed.'

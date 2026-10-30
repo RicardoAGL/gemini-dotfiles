@@ -12,8 +12,16 @@ Ensure-PowerShellGemFunction
 Ensure-WindowsGemWrapper
 Ensure-InfisicalSafeWrapper
 
-if (Get-Command python -ErrorAction SilentlyContinue) {
-    & python (Join-Path $PSScriptRoot 'sync-claude-plugins.py')
+$pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+if (-not $pythonCommand) {
+    $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue
+}
+if (-not $pythonCommand) {
+    throw 'Python is required to establish Gemini skill parity.'
+}
+& $pythonCommand.Source (Join-Path $PSScriptRoot 'sync-claude-plugins.py')
+if ($LASTEXITCODE -ne 0) {
+    throw "Gemini skill sync failed with exit code $LASTEXITCODE."
 }
 
 Write-Host "Global GEMINI.md: $mode -> $targetContext"

@@ -1,215 +1,604 @@
 #!/usr/bin/env python3
-"""
-Sync Claude Skills and Plugins to Gemini / Antigravity.
+"""Install reviewed Claude skills into Gemini/Antigravity as managed snapshots.
 
-Mirrors:
-1. Canonical dotfiles skills (from claude-dotfiles/skills or ~/.claude/skills) via symlinks
-   (falling back to copy on platforms where symlinks are restricted).
-2. Enabled Claude plugin skills (from ~/.claude/plugins/cache).
+The deployed Claude skill directory is preferred over a mutable repository checkout.
+Every installed skill is validated, copied as a complete package, and recorded in a
+manifest so later runs can update or remove only entries this script owns.
 """
+
+from __future__ import annotations
+
+import hashlib
 import json
 import os
+import re
 import shutil
 import sys
+import tempfile
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
-CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
-CLAUDE_PLUGINS_CACHE = Path.home() / ".claude" / "plugins" / "cache"
-CLAUDE_USER_SKILLS = Path.home() / ".claude" / "skills"
-GEMINI_SKILLS_DIR = Path.home() / ".gemini" / "skills"
 
-def get_canonical_skills_dirs():
-    """Find directories containing canonical skills (claude-dotfiles, ~/.claude/skills)."""
-    candidates = []
+OWNER = "claude-dotfiles-sync"
+MANIFEST_NAME = ".claude-sync-manifest.json"
+SCHEMA_VERSION = 1
+NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def configured_path(environment_name: str, default: Path) -> Path:
+    value = os.environ.get(environment_name)
+    return Path(value).expanduser() if value else default
+
+
+CLAUDE_SETTINGS_PATH = configured_path(
+    "GEMINI_SYNC_CLAUDE_SETTINGS", Path.home() / ".claude" / "settings.json"
+)
+CLAUDE_PLUGINS_CACHE = configured_path(
+    "GEMINI_SYNC_PLUGIN_CACHE", Path.home() / ".claude" / "plugins" / "cache"
+)
+CLAUDE_USER_SKILLS = configured_path(
+    "GEMINI_SYNC_CLAUDE_SKILLS", Path.home() / ".claude" / "skills"
+)
+GEMINI_SKILLS_DIR = configured_path(
+    "GEMINI_SYNC_TARGET", Path.home() / ".gemini" / "skills"
+)
+
+
+class SyncError(RuntimeError):
+    """A parity or ownership violation that must fail bootstrap."""
+
+
+@dataclass(frozen=True)
+class DesiredSkill:
+    name: str
+    source: Path
+    source_type: str
+    sha256: str
+    plugin: str | None = None
+    version: str | None = None
+    single_file: bool = False
+
+    def manifest_entry(self) -> dict[str, str]:
+        entry = {
+            "owner": OWNER,
+            "sourceType": self.source_type,
+            "source": str(self.source.resolve()),
+            "sha256": self.sha256,
+        }
+        if self.plugin:
+            entry["plugin"] = self.plugin
+        if self.version:
+            entry["version"] = self.version
+        return entry
+
+
+def is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def repository_skill_candidates() -> list[Path]:
     script_dir = Path(__file__).resolve().parent
     repo_root = script_dir.parent
     source_map_path = repo_root / "source-map.json"
+    candidates: list[Path] = []
 
     if source_map_path.exists():
         try:
-            sm = json.loads(source_map_path.read_text(encoding="utf-8"))
-            claude_repo_name = sm.get("canonical", {}).get("claudeDotfilesRepo", "claude-dotfiles")
-            repo_skills = repo_root.parent / claude_repo_name / "skills"
-            if repo_skills.exists() and repo_skills.is_dir():
-                candidates.append(repo_skills)
-        except Exception as e:
-            print(f"Warning reading source-map.json: {e}")
+            source_map = json.loads(source_map_path.read_text(encoding="utf-8"))
+            claude_repo_name = source_map.get("canonical", {}).get(
+                "claudeDotfilesRepo", "claude-dotfiles"
+            )
+            candidates.append(repo_root.parent / claude_repo_name / "skills")
+        except (OSError, json.JSONDecodeError) as error:
+            raise SyncError(f"Cannot read {source_map_path}: {error}") from error
 
-    # Standard workspace locations
-    for parent in [
-        Path.home() / "Desktop" / "github",
-        Path.home() / "desktop" / "github",
-        Path("C:/github"),
-    ]:
-        repo_skills = parent / "claude-dotfiles" / "skills"
-        if repo_skills.exists() and repo_skills.is_dir() and repo_skills not in candidates:
-            candidates.append(repo_skills)
+    candidates.extend(
+        [
+            Path.home() / "Desktop" / "github" / "claude-dotfiles" / "skills",
+            Path.home() / "desktop" / "github" / "claude-dotfiles" / "skills",
+            Path("C:/github/claude-dotfiles/skills"),
+        ]
+    )
+    return list(dict.fromkeys(candidates))
 
-    # Runtime fallback
-    if CLAUDE_USER_SKILLS.exists() and CLAUDE_USER_SKILLS.is_dir() and CLAUDE_USER_SKILLS not in candidates:
-        candidates.append(CLAUDE_USER_SKILLS)
 
-    return candidates
+def get_canonical_skills_dirs() -> list[Path]:
+    """Return one reviewed canonical source, preferring the versioned repository."""
+    explicit = os.environ.get("GEMINI_SYNC_CANONICAL_SKILLS")
+    if explicit:
+        source = Path(explicit).expanduser()
+        if not source.is_dir():
+            raise SyncError(f"Configured canonical skill directory is missing: {source}")
+        return [source]
 
-def get_enabled_plugins():
+    for candidate in repository_skill_candidates():
+        if candidate.is_dir():
+            return [candidate]
+
+    if CLAUDE_USER_SKILLS.is_dir():
+        return [CLAUDE_USER_SKILLS]
+    return []
+
+
+def legacy_canonical_roots(canonical_roots: list[Path]) -> list[Path]:
+    """Recognize links produced by the old repo-symlink implementation."""
+    roots = list(canonical_roots)
+    roots.extend(
+        candidate
+        for candidate in repository_skill_candidates()
+        if candidate.parent.exists()
+    )
+    return list(dict.fromkeys(path.resolve(strict=False) for path in roots))
+
+
+def get_enabled_plugins() -> list[str]:
     if not CLAUDE_SETTINGS_PATH.exists():
         return []
-
     try:
         settings = json.loads(CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8"))
-        plugins_dict = settings.get("enabledPlugins", {})
-        return [k for k, v in plugins_dict.items() if v]
-    except Exception as e:
-        print(f"Error reading Claude settings: {e}")
-        return []
+    except (OSError, json.JSONDecodeError) as error:
+        raise SyncError(f"Cannot read Claude plugin settings: {error}") from error
+    plugins = settings.get("enabledPlugins", {})
+    if not isinstance(plugins, dict):
+        raise SyncError("Claude settings enabledPlugins must be an object.")
+    return sorted(key for key, enabled in plugins.items() if enabled)
 
-def link_or_copy_skill(src_dir: Path, target_dir: Path) -> str:
-    """Link source skill directory to target, falling back to copy."""
-    resolved_src = src_dir.resolve()
-    if not resolved_src.exists():
-        return "missing_source"
 
-    if target_dir.is_symlink():
-        try:
-            if target_dir.resolve() == resolved_src:
-                return "already_linked"
-            target_dir.unlink()
-        except OSError:
-            target_dir.unlink()
-    elif target_dir.exists():
-        if target_dir.is_file():
-            target_dir.unlink()
-        elif target_dir.is_dir():
-            shutil.rmtree(target_dir)
-
+def parse_frontmatter(skill_file: Path) -> tuple[str, str]:
     try:
-        target_dir.symlink_to(resolved_src, target_is_directory=True)
-        return "linked"
-    except (OSError, NotImplementedError):
-        shutil.copytree(resolved_src, target_dir)
-        return "copied"
+        content = skill_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise SyncError(f"Cannot read skill manifest {skill_file}: {error}") from error
+    lines = content.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise SyncError(f"Skill manifest lacks YAML frontmatter: {skill_file}")
+    try:
+        end = next(index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---")
+    except StopIteration as error:
+        raise SyncError(
+            f"Skill manifest has unterminated YAML frontmatter: {skill_file}"
+        ) from error
 
-def sync_canonical_skills():
-    """Sync canonical skills into GEMINI_SKILLS_DIR."""
-    canonical_dirs = get_canonical_skills_dirs()
-    if not canonical_dirs:
-        print("No canonical skills directories found.")
-        return 0
+    values: dict[str, str] = {}
+    for line in lines[1:end]:
+        if not line or line[0].isspace() or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        values[key.strip()] = value.strip()
 
-    GEMINI_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-    synced_count = 0
-    seen_skills = set()
+    name = values.get("name", "").strip("'\"")
+    description = values.get("description", "")
+    if not NAME_PATTERN.fullmatch(name):
+        raise SyncError(f"Invalid skill name '{name}' in {skill_file}")
+    if not description:
+        raise SyncError(f"Skill description is missing in {skill_file}")
+    return name, description
 
-    for base_dir in canonical_dirs:
-        print(f"Scanning canonical skills in: {base_dir}")
-        for entry in base_dir.iterdir():
-            if entry.name.startswith("."):
+
+def package_manifest(source: Path, expected_name: str | None = None) -> tuple[str, Path]:
+    skill_file = source / "SKILL.md"
+    if not skill_file.is_file():
+        raise SyncError(f"Skill package has no SKILL.md: {source}")
+    name, _ = parse_frontmatter(skill_file)
+    if expected_name and name != expected_name:
+        raise SyncError(
+            f"Skill directory '{expected_name}' disagrees with frontmatter name "
+            f"'{name}': {skill_file}"
+        )
+    return name, skill_file
+
+
+def directory_hash(source: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(source.rglob("*"), key=lambda item: item.relative_to(source).as_posix()):
+        if path.is_symlink():
+            raise SyncError(f"Skill packages may not contain symlinks: {path}")
+        if not path.is_file():
+            continue
+        relative = path.relative_to(source).as_posix().encode("utf-8")
+        digest.update(relative)
+        digest.update(b"\0")
+        digest.update(b"x" if path.stat().st_mode & 0o111 else b"-")
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def single_file_hash(source: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"SKILL.md\0")
+    digest.update(b"x" if source.stat().st_mode & 0o111 else b"-")
+    digest.update(b"\0")
+    digest.update(source.read_bytes())
+    digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def target_hash(target: Path) -> str:
+    if target.is_symlink():
+        raise SyncError(f"Managed snapshot unexpectedly became a symlink: {target}")
+    if not target.is_dir():
+        raise SyncError(f"Managed skill is not a directory: {target}")
+    return directory_hash(target)
+
+
+def add_desired(desired: dict[str, DesiredSkill], skill: DesiredSkill) -> None:
+    current = desired.get(skill.name)
+    if current is None:
+        desired[skill.name] = skill
+        return
+    if current.source_type == "canonical":
+        return
+    if current.sha256 != skill.sha256:
+        raise SyncError(
+            f"Conflicting managed sources for skill '{skill.name}': "
+            f"{current.source} and {skill.source}"
+        )
+
+
+def discover_canonical_skills(roots: list[Path]) -> dict[str, DesiredSkill]:
+    desired: dict[str, DesiredSkill] = {}
+    for root in roots:
+        if not root.is_dir():
+            raise SyncError(f"Canonical skill directory is missing: {root}")
+        print(f"Scanning canonical skills in: {root}")
+        for entry in sorted(root.iterdir(), key=lambda item: item.name):
+            if entry.name.startswith(".") or not entry.is_dir():
                 continue
+            name, _ = package_manifest(entry, entry.name)
+            add_desired(desired, DesiredSkill(name, entry, "canonical", directory_hash(entry)))
+    return desired
 
-            resolved_entry = entry.resolve()
-            if not resolved_entry.is_dir():
+
+def plugin_identity(plugin_id: str) -> tuple[str, str | None]:
+    name, separator, marketplace = plugin_id.partition("@")
+    return name, marketplace if separator else None
+
+
+def plugin_roots(plugin_id: str) -> list[Path]:
+    plugin_name, marketplace = plugin_identity(plugin_id)
+    if marketplace:
+        candidate = CLAUDE_PLUGINS_CACHE / marketplace / plugin_name
+        return [candidate] if candidate.is_dir() else []
+    if not CLAUDE_PLUGINS_CACHE.is_dir():
+        return []
+    return sorted(
+        [
+            candidate / plugin_name
+            for candidate in CLAUDE_PLUGINS_CACHE.iterdir()
+            if (candidate / plugin_name).is_dir()
+        ],
+        key=lambda path: str(path),
+    )
+
+
+def version_directories(plugin_root: Path) -> list[Path]:
+    if any((plugin_root / name).is_dir() for name in ("skills", "agents", "commands")):
+        return [plugin_root]
+    return [child for child in plugin_root.iterdir() if child.is_dir()]
+
+
+def select_plugin_version(plugin_id: str) -> Path:
+    versions = [
+        version
+        for root in plugin_roots(plugin_id)
+        for version in version_directories(root)
+    ]
+    if not versions:
+        raise SyncError(f"Enabled plugin is missing from the Claude cache: {plugin_id}")
+    return max(versions, key=lambda path: (path.stat().st_mtime_ns, path.name, str(path)))
+
+
+def version_label(version_dir: Path) -> str:
+    return version_dir.name
+
+
+def valid_single_file_candidate(path: Path) -> tuple[str, str] | None:
+    try:
+        return parse_frontmatter(path)
+    except SyncError:
+        return None
+
+
+def discover_plugin_skills(
+    enabled_plugins: list[str], desired: dict[str, DesiredSkill]
+) -> None:
+    for plugin_id in enabled_plugins:
+        version_dir = select_plugin_version(plugin_id)
+        print(f"Processing plugin: {plugin_id} ({version_label(version_dir)})")
+        real_names: set[str] = set()
+        skills_root = version_dir / "skills"
+        if skills_root.is_dir():
+            for manifest in sorted(skills_root.rglob("SKILL.md"), key=lambda path: str(path)):
+                package = manifest.parent
+                name, _ = package_manifest(package)
+                real_names.add(name)
+                add_desired(
+                    desired,
+                    DesiredSkill(
+                        name,
+                        package,
+                        "plugin",
+                        directory_hash(package),
+                        plugin=plugin_id,
+                        version=version_label(version_dir),
+                    ),
+                )
+
+        for kind in ("agents", "commands"):
+            source_root = version_dir / kind
+            if not source_root.is_dir():
                 continue
+            for document in sorted(source_root.rglob("*.md"), key=lambda path: str(path)):
+                if document.name.lower() == "readme.md" or {
+                    "references",
+                    "templates",
+                } & set(document.parts):
+                    continue
+                parsed = valid_single_file_candidate(document)
+                if parsed is None:
+                    print(f"  skipped non-skill {kind} document: {document}")
+                    continue
+                name, _ = parsed
+                if name in real_names or name in desired:
+                    continue
+                add_desired(
+                    desired,
+                    DesiredSkill(
+                        name,
+                        document,
+                        "plugin",
+                        single_file_hash(document),
+                        plugin=plugin_id,
+                        version=version_label(version_dir),
+                        single_file=True,
+                    ),
+                )
 
-            # Verify it is a skill (contains SKILL.md or skill.md)
-            has_skill_md = (
-                (resolved_entry / "SKILL.md").exists()
-                or (resolved_entry / "skill.md").exists()
+
+def collect_all_legacy_plugin_hashes() -> dict[str, set[str]]:
+    hashes: dict[str, set[str]] = {}
+    if not CLAUDE_PLUGINS_CACHE.is_dir():
+        return hashes
+    for document in CLAUDE_PLUGINS_CACHE.rglob("*.md"):
+        if document.name.lower() == "readme.md" or {
+            "references",
+            "templates",
+        } & set(document.parts):
+            continue
+        if not {"agents", "commands", "skills"} & set(document.parts):
+            continue
+        name = document.stem if document.stem.lower() != "skill" else document.parent.name
+        hashes.setdefault(name, set()).add(hashlib.sha256(document.read_bytes()).hexdigest())
+    return hashes
+
+
+def load_manifest() -> dict:
+    path = GEMINI_SKILLS_DIR / MANIFEST_NAME
+    if not path.exists():
+        return {"schemaVersion": SCHEMA_VERSION, "owner": OWNER, "entries": {}}
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SyncError(f"Cannot read managed skill manifest {path}: {error}") from error
+    if manifest.get("schemaVersion") != SCHEMA_VERSION or manifest.get("owner") != OWNER:
+        raise SyncError(f"Unsupported or foreign managed skill manifest: {path}")
+    if not isinstance(manifest.get("entries"), dict):
+        raise SyncError(f"Managed skill manifest entries must be an object: {path}")
+    invalid_names = [name for name in manifest["entries"] if not NAME_PATTERN.fullmatch(name)]
+    if invalid_names:
+        raise SyncError(
+            "Managed skill manifest contains invalid names: "
+            + ", ".join(sorted(invalid_names))
+        )
+    return manifest
+
+
+def write_manifest(entries: dict[str, dict[str, str]]) -> None:
+    manifest_path = GEMINI_SKILLS_DIR / MANIFEST_NAME
+    handle, temporary_name = tempfile.mkstemp(
+        prefix=f".{MANIFEST_NAME}.", dir=GEMINI_SKILLS_DIR, text=True
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(
+                {"schemaVersion": SCHEMA_VERSION, "owner": OWNER, "entries": entries},
+                stream,
+                indent=2,
+                sort_keys=True,
             )
-            if not has_skill_md:
+            stream.write("\n")
+        os.replace(temporary_path, manifest_path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def symlink_target_path(target: Path) -> Path | None:
+    if not target.is_symlink():
+        return None
+    raw = Path(os.readlink(target))
+    if raw.is_absolute():
+        return raw.resolve(strict=False)
+    return (target.parent / raw).resolve(strict=False)
+
+
+def is_legacy_canonical_link(target: Path, canonical_roots: list[Path]) -> bool:
+    linked = symlink_target_path(target)
+    return linked is not None and any(is_within(linked, root.resolve()) for root in canonical_roots)
+
+
+def legacy_flat_plugin_target(target: Path, expected_hashes: set[str]) -> bool:
+    if not target.is_dir() or target.is_symlink():
+        return False
+    entries = [entry for entry in target.iterdir() if not entry.name.startswith(".")]
+    if len(entries) != 1 or entries[0].name != "SKILL.md" or not entries[0].is_file():
+        return False
+    return hashlib.sha256(entries[0].read_bytes()).hexdigest() in expected_hashes
+
+
+def remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def install_snapshot(skill: DesiredSkill, target: Path) -> None:
+    staging_root = Path(tempfile.mkdtemp(prefix=f".{skill.name}.sync-", dir=GEMINI_SKILLS_DIR))
+    staged = staging_root / skill.name
+    backup = GEMINI_SKILLS_DIR / f".{skill.name}.backup-{uuid.uuid4().hex}"
+    replaced = False
+    try:
+        if skill.single_file:
+            staged.mkdir()
+            shutil.copy2(skill.source, staged / "SKILL.md")
+        else:
+            shutil.copytree(skill.source, staged)
+        if directory_hash(staged) != skill.sha256:
+            raise SyncError(f"Staged skill hash changed while copying: {skill.name}")
+        if target.exists() or target.is_symlink():
+            target.rename(backup)
+            replaced = True
+        staged.rename(target)
+        if replaced:
+            remove_path(backup)
+    except Exception:
+        if (
+            not (target.exists() or target.is_symlink())
+            and replaced
+            and (backup.exists() or backup.is_symlink())
+        ):
+            backup.rename(target)
+        raise
+    finally:
+        if staging_root.exists():
+            shutil.rmtree(staging_root)
+        if backup.exists() or backup.is_symlink():
+            remove_path(backup)
+
+
+def sync_managed_skills(
+    desired: dict[str, DesiredSkill],
+    canonical_roots: list[Path],
+    legacy_hashes: dict[str, set[str]],
+) -> tuple[int, int]:
+    if GEMINI_SKILLS_DIR.is_symlink():
+        raise SyncError(f"Managed skill root must not be a symlink: {GEMINI_SKILLS_DIR}")
+    GEMINI_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    manifest = load_manifest()
+    old_entries = manifest["entries"]
+    conflicts: list[str] = []
+    actions: dict[str, str] = {}
+
+    for name, skill in desired.items():
+        target = GEMINI_SKILLS_DIR / name
+        exists = target.exists() or target.is_symlink()
+        if not exists:
+            actions[name] = "install"
+            continue
+        old = old_entries.get(name)
+        if isinstance(old, dict) and old.get("owner") == OWNER:
+            if target.is_symlink():
+                conflicts.append(f"managed target became a symlink: {name}")
                 continue
+            current_hash = target_hash(target)
+            if current_hash == skill.sha256:
+                actions[name] = "unchanged"
+            elif current_hash == old.get("sha256"):
+                actions[name] = "refresh"
+            else:
+                conflicts.append(f"managed target has local changes: {name}")
+            continue
+        if is_legacy_canonical_link(target, canonical_roots) or legacy_flat_plugin_target(
+            target, legacy_hashes.get(name, set())
+        ):
+            actions[name] = "migrate"
+        else:
+            conflicts.append(f"unmanaged target already exists: {name}")
 
-            skill_name = entry.name
-            if skill_name in seen_skills:
-                continue
+    stale_managed: list[str] = []
+    for name, old in old_entries.items():
+        if name in desired:
+            continue
+        target = GEMINI_SKILLS_DIR / name
+        if not (target.exists() or target.is_symlink()):
+            stale_managed.append(name)
+            continue
+        if target.is_symlink() or not isinstance(old, dict) or old.get("owner") != OWNER:
+            conflicts.append(f"stale managed target cannot be verified: {name}")
+            continue
+        if target_hash(target) != old.get("sha256"):
+            conflicts.append(f"stale managed target has local changes: {name}")
+            continue
+        stale_managed.append(name)
 
-            target_path = GEMINI_SKILLS_DIR / skill_name
-            status = link_or_copy_skill(entry, target_path)
-            seen_skills.add(skill_name)
-            synced_count += 1
-            if status in ("linked", "copied"):
-                print(f"  {status}: {skill_name}")
+    stale_legacy: list[str] = []
+    for target in GEMINI_SKILLS_DIR.iterdir():
+        name = target.name
+        if name.startswith(".") or name in desired or name in old_entries:
+            continue
+        if is_legacy_canonical_link(target, canonical_roots) or legacy_flat_plugin_target(
+            target, legacy_hashes.get(name, set())
+        ):
+            stale_legacy.append(name)
 
-    print(f"Canonical skills synced: {synced_count}")
-    return synced_count
+    if conflicts:
+        raise SyncError("Skill sync conflicts:\n- " + "\n- ".join(sorted(conflicts)))
 
-def extract_skills_from_plugin(plugin_dir, plugin_name):
-    """Extract skills from a Claude plugin cache directory."""
-    subdirs = [d for d in plugin_dir.iterdir() if d.is_dir()]
-    if not subdirs:
-        return 0
+    changed = 0
+    for name in sorted(desired):
+        action = actions[name]
+        if action == "unchanged":
+            print(f"  unchanged: {name}")
+            continue
+        install_snapshot(desired[name], GEMINI_SKILLS_DIR / name)
+        changed += 1
+        print(f"  {action}: {name}")
 
-    extracted = 0
-    for version_dir in subdirs:
-        targets = ["agents", "commands", "skills"]
-        for target in targets:
-            target_dir = version_dir / target
-            if not target_dir.exists():
-                continue
+    for name in sorted(set(stale_managed + stale_legacy)):
+        target = GEMINI_SKILLS_DIR / name
+        if target.exists() or target.is_symlink():
+            remove_path(target)
+        changed += 1
+        print(f"  removed stale managed skill: {name}")
 
-            for file_path in target_dir.rglob("*.md"):
-                if file_path.name.lower() == "readme.md":
-                    continue
+    entries = {name: desired[name].manifest_entry() for name in sorted(desired)}
+    write_manifest(entries)
+    return len(desired), changed
 
-                skill_name = file_path.stem
-                if skill_name.lower() == "skill":
-                    skill_name = file_path.parent.name
 
-                if "references" in file_path.parts or "templates" in file_path.parts:
-                    continue
+def main() -> int:
+    print("=== Syncing managed Claude skills to Gemini/Antigravity ===")
+    canonical_roots = get_canonical_skills_dirs()
+    if not canonical_roots:
+        raise SyncError("No canonical Claude skill directory was found.")
+    enabled_plugins = get_enabled_plugins()
+    desired = discover_canonical_skills(canonical_roots)
+    discover_plugin_skills(enabled_plugins, desired)
+    legacy_hashes = collect_all_legacy_plugin_hashes()
+    active, changed = sync_managed_skills(
+        desired, legacy_canonical_roots(canonical_roots), legacy_hashes
+    )
+    plugin_count = sum(1 for skill in desired.values() if skill.source_type == "plugin")
+    canonical_count = active - plugin_count
+    print(
+        f"Done. Canonical: {canonical_count}, Plugins: {plugin_count}, "
+        f"Managed active: {active}, Changed: {changed}"
+    )
+    return 0
 
-                # Don't overwrite canonical skills with plugin cache
-                gemini_skill_dir = GEMINI_SKILLS_DIR / skill_name
-                if gemini_skill_dir.exists() and (gemini_skill_dir.is_symlink() or (gemini_skill_dir / "SKILL.md").exists()):
-                    continue
-
-                content = file_path.read_text(encoding="utf-8")
-                gemini_skill_dir.mkdir(parents=True, exist_ok=True)
-                gemini_skill_path = gemini_skill_dir / "SKILL.md"
-                gemini_skill_path.write_text(content, encoding="utf-8")
-                extracted += 1
-                print(f"  Plugin exported: {skill_name}")
-
-    return extracted
-
-def sync_plugin_skills():
-    """Sync enabled Claude plugins into GEMINI_SKILLS_DIR."""
-    if not CLAUDE_PLUGINS_CACHE.exists():
-        return 0
-
-    enabled = get_enabled_plugins()
-    if not enabled:
-        return 0
-
-    print("Syncing enabled Claude plugins to Gemini skills...")
-    total_plugins = 0
-    for plugin_id in enabled:
-        plugin_name = plugin_id.split('@')[0]
-        found = False
-        for marketplace_dir in CLAUDE_PLUGINS_CACHE.iterdir():
-            if not marketplace_dir.is_dir():
-                continue
-
-            plugin_dir = marketplace_dir / plugin_name
-            if plugin_dir.exists():
-                print(f"Processing plugin: {plugin_name}")
-                total_plugins += extract_skills_from_plugin(plugin_dir, plugin_name)
-                found = True
-
-        if not found:
-            print(f"Notice: Cache directory for plugin '{plugin_name}' not found.")
-
-    return total_plugins
-
-def main():
-    print("=== Syncing Skills & Plugins to Gemini/Antigravity ===")
-    canonical_count = sync_canonical_skills()
-    plugin_count = sync_plugin_skills()
-
-    total = len([
-        d for d in GEMINI_SKILLS_DIR.iterdir()
-        if d.is_dir() and ((d / "SKILL.md").exists() or (d / "skill.md").exists())
-    ])
-    print(f"Done. Canonical: {canonical_count}, Plugins: {plugin_count}, Total active skills: {total}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        raise SystemExit(main())
+    except SyncError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        raise SystemExit(1)

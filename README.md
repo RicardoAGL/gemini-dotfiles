@@ -14,6 +14,7 @@ Claude remains the canonical source of truth. This repo translates the portable 
 - Gemini CLI installation through npm
 - Global Gemini memory file at `~/.gemini/GEMINI.md`
 - Global Gemini settings at `~/.gemini/settings.json`
+- Validated Claude skill snapshots at `~/.gemini/skills/<skill-name>/`
 - Repo onboarding helper for Claude-first projects
 - Shell alias/profile wiring for `gem`
 - Shared `infisical-safe-wrapper` command installation when the sibling repo is present
@@ -76,6 +77,10 @@ powershell -ExecutionPolicy Bypass -File C:\github\gemini-dotfiles\scripts\ci\lo
 
 - Global Claude rules -> global Gemini `GEMINI.md`: generated translation
 - Claude-first repos -> repo-local `GEMINI.md`: generated wrapper that imports `AGENTS.md` and/or `CLAUDE.md`
+- Reviewed Claude skills -> complete, validated directories under `~/.gemini/skills`
+- Enabled Claude plugins -> real `skills/` packages, including their `scripts/`, `references/`, and `assets/`; command or agent documents are used only when they are valid standalone skills
+- The versioned sibling `claude-dotfiles/skills` checkout is the preferred canonical source; deployed `~/.claude/skills` is a fallback when that checkout is unavailable
+- `.claude-sync-manifest.json` records sync ownership, source, plugin version, and content hash so repeat runs can safely refresh or retire managed snapshots
 - Existing Gemini auth material under `~/.gemini` is preserved
 - Existing user settings are preserved and merged with the managed defaults
 
@@ -92,6 +97,8 @@ powershell -ExecutionPolicy Bypass -File C:\github\gemini-dotfiles\scripts\ci\lo
 - No Claude files are deleted.
 - Existing Gemini auth files are not touched.
 - Existing Gemini settings are merged, not replaced wholesale.
+- Unmanaged entries under `~/.gemini/skills` are never overwritten or removed, including same-name collisions.
+- Invalid skill frontmatter, modified managed snapshots, missing Python, and other parity failures stop bootstrap with a non-zero exit.
 - YOLO mode is only enabled through the shell shortcut, not forced into persistent settings.
 
 ## Files
@@ -101,6 +108,7 @@ powershell -ExecutionPolicy Bypass -File C:\github\gemini-dotfiles\scripts\ci\lo
 - `scripts/install-gemini-cli.ps1`
 - `scripts/bootstrap.sh`
 - `scripts/bootstrap.ps1`
+- `scripts/sync-claude-plugins.py`
 - both bootstrap scripts also install the shared `infisical-safe-wrapper` wrapper when available
 - `scripts/use-project.sh`
 - `scripts/use-project.ps1`

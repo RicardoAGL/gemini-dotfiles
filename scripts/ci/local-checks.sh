@@ -18,5 +18,9 @@ assert data["integrations"]["infisicalWrapper"]["repoPath"] == "infisical-safe-w
 print("OK  source-map structure")
 PY
 
+echo '==> managed skill sync tests'
+python3 "$root/tests/test_sync_claude_plugins.py" -v
+echo 'OK  managed skill sync tests'
+
 echo
 echo 'Local CI baseline passed.'

@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -23,11 +24,17 @@ def load_sync_module():
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Cannot load {SCRIPT_PATH}")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
 
-def write_skill(root: Path, name: str, description: str, extras: dict[str, str] | None = None) -> Path:
+def write_skill(
+    root: Path,
+    name: str,
+    description: str,
+    extras: dict[str, str] | None = None,
+) -> Path:
     skill_dir = root / name
     skill_dir.mkdir(parents=True, exist_ok=True)
     (skill_dir / "SKILL.md").write_text(
@@ -93,6 +100,7 @@ class SkillSyncTests(unittest.TestCase):
 
     def test_unmanaged_same_name_target_is_preserved_and_sync_fails(self):
         write_skill(self.canonical, "collision", "Canonical version.")
+        write_skill(self.canonical, "would-install", "Must remain unapplied on conflict.")
         unmanaged = write_skill(self.target, "collision", "User-owned version.")
         before = (unmanaged / "SKILL.md").read_text(encoding="utf-8")
 
@@ -100,21 +108,89 @@ class SkillSyncTests(unittest.TestCase):
             self.run_sync()
 
         self.assertEqual((unmanaged / "SKILL.md").read_text(encoding="utf-8"), before)
+        self.assertFalse((self.target / "would-install").exists())
         self.assertFalse((self.target / MANIFEST_NAME).exists())
+
+    def test_symlinked_target_root_is_rejected_without_following_it(self):
+        write_skill(self.canonical, "alpha-skill", "Canonical version.")
+        external = self.root / "external-target"
+        external.mkdir()
+        self.target.symlink_to(external, target_is_directory=True)
+
+        with self.assertRaises(self.module.SyncError):
+            self.run_sync()
+
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_legacy_flat_plugin_export_is_migrated_to_complete_package(self):
+        self.settings.write_text(
+            json.dumps({"enabledPlugins": {"coderlm@test-marketplace": True}}),
+            encoding="utf-8",
+        )
+        version = self.cache / "test-marketplace" / "coderlm" / "1.0.0"
+        (version / "commands").mkdir(parents=True)
+        old_command = version / "commands" / "coderlm.md"
+        old_command.write_text("# Legacy command export\n", encoding="utf-8")
+        write_skill(
+            version / "skills",
+            "coderlm",
+            "Complete plugin package.",
+            {"scripts/coderlm_cli.py": "print('complete')\n"},
+        )
+        legacy = self.target / "coderlm"
+        legacy.mkdir(parents=True)
+        (legacy / "SKILL.md").write_bytes(old_command.read_bytes())
+
+        result, output = self.run_sync()
+
+        self.assertEqual(result, 0)
+        self.assertIn("migrate: coderlm", output)
+        self.assertTrue((legacy / "scripts" / "coderlm_cli.py").is_file())
+        self.assertIn("Complete plugin package", (legacy / "SKILL.md").read_text(encoding="utf-8"))
+
+    def test_disabled_plugin_legacy_export_is_removed_but_user_skill_remains(self):
+        version = self.cache / "test-marketplace" / "retired" / "1.0.0"
+        (version / "commands").mkdir(parents=True)
+        old_command = version / "commands" / "retired.md"
+        old_command.write_text("# Retired plugin command\n", encoding="utf-8")
+        legacy = self.target / "retired"
+        legacy.mkdir(parents=True)
+        (legacy / "SKILL.md").write_bytes(old_command.read_bytes())
+        user_skill = write_skill(self.target, "user-skill", "Unmanaged and preserved.")
+
+        result, output = self.run_sync()
+
+        self.assertEqual(result, 0)
+        self.assertFalse(legacy.exists())
+        self.assertTrue(user_skill.is_dir())
+        self.assertIn("removed stale managed skill: retired", output)
+
+    def test_broken_legacy_repo_symlink_is_removed(self):
+        repo_skills = self.root / "repo-skills"
+        repo_skills.mkdir()
+        self.module.repository_skill_candidates = lambda: [repo_skills]
+        self.target.mkdir()
+        stale = self.target / "old-branch-skill"
+        stale.symlink_to(repo_skills / "old-branch-skill", target_is_directory=True)
+
+        result, output = self.run_sync()
+
+        self.assertEqual(result, 0)
+        self.assertFalse(stale.is_symlink())
+        self.assertIn("removed stale managed skill: old-branch-skill", output)
 
     def test_managed_skill_refreshes_and_second_identical_run_is_unchanged(self):
         source = write_skill(self.canonical, "refreshable", "Version one.")
         first_result, _ = self.run_sync()
         first_manifest = self.read_manifest()
         installed = self.target / "refreshable"
-        first_inode = installed.stat().st_ino
-
         (source / "SKILL.md").write_text(
             "---\nname: refreshable\ndescription: Version two.\n---\n",
             encoding="utf-8",
         )
         second_result, _ = self.run_sync()
         second_manifest = self.read_manifest()
+        refreshed_inode = installed.stat().st_ino
         third_result, third_output = self.run_sync()
 
         self.assertEqual((first_result, second_result, third_result), (0, 0, 0))
@@ -123,7 +199,7 @@ class SkillSyncTests(unittest.TestCase):
             second_manifest["entries"]["refreshable"]["sha256"],
         )
         self.assertIn("Version two", (installed / "SKILL.md").read_text(encoding="utf-8"))
-        self.assertEqual(installed.stat().st_ino, first_inode)
+        self.assertEqual(installed.stat().st_ino, refreshed_inode)
         self.assertIn("unchanged: refreshable", third_output)
 
     def test_real_plugin_skill_package_beats_command_document(self):
@@ -133,7 +209,9 @@ class SkillSyncTests(unittest.TestCase):
         )
         version = self.cache / "test-marketplace" / "coderlm" / "1.0.0"
         (version / "commands").mkdir(parents=True)
-        (version / "commands" / "coderlm.md").write_text("# Command, not a skill\n", encoding="utf-8")
+        (version / "commands" / "coderlm.md").write_text(
+            "# Command, not a skill\n", encoding="utf-8"
+        )
         write_skill(
             version / "skills",
             "coderlm",
@@ -182,6 +260,25 @@ class SkillSyncTests(unittest.TestCase):
             self.run_sync()
 
         self.assertFalse((self.target / "invalid_skill").exists())
+
+    def test_invalid_manifest_entry_name_fails_without_touching_targets(self):
+        self.target.mkdir()
+        user_skill = write_skill(self.target, "user-skill", "Unmanaged and preserved.")
+        (self.target / MANIFEST_NAME).write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "owner": "claude-dotfiles-sync",
+                    "entries": {"../outside": {"owner": "claude-dotfiles-sync"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(self.module.SyncError):
+            self.run_sync()
+
+        self.assertTrue(user_skill.is_dir())
 
     def test_stale_unmodified_managed_skill_is_removed(self):
         source = write_skill(self.canonical, "stale-skill", "Will become stale.")
