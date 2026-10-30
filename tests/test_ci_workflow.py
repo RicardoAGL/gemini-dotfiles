@@ -47,6 +47,14 @@ class WorkflowContractTests(unittest.TestCase):
             ],
         )
         self.assertNotRegex(self.text, r"uses:\s*[^\s]+@(main|master|v\d+)\b")
+        hardened_checkout = re.findall(
+            rf"(?m)^\s+uses:\s*actions/checkout@{CHECKOUT_SHA}\s*$"
+            r"\n^\s+with:\s*$"
+            r"\n^\s+persist-credentials:\s*false\s*$",
+            self.text,
+        )
+        self.assertEqual(len(hardened_checkout), 2)
+        self.assertEqual(self.text.count("persist-credentials: false"), 2)
 
 
 if __name__ == "__main__":

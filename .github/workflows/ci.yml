@@ -22,6 +22,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
       - name: Run Unix local baseline
         run: bash scripts/ci/local-checks.sh
 
@@ -35,5 +37,7 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
       - name: Run PowerShell local baseline
         run: ./scripts/ci/local-checks.ps1
