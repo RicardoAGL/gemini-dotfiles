@@ -195,6 +195,26 @@ class SkillSyncTests(unittest.TestCase):
         self.assertTrue(quarantined[0].is_symlink())
         self.assertIn("quarantined stale managed skill: old-branch-skill", output)
 
+    def test_move_path_removes_source_when_rename_duplicates_symlink(self):
+        source_target = self.root / "missing-skill"
+        source = self.root / "source-link"
+        destination = self.root / "destination-link"
+        source.symlink_to(source_target, target_is_directory=True)
+        original_rename = Path.rename
+
+        def duplicate_symlink(path: Path, target: Path) -> Path:
+            if path == source:
+                target.symlink_to(os.readlink(path), target_is_directory=True)
+                return target
+            return original_rename(path, target)
+
+        with mock.patch.object(Path, "rename", duplicate_symlink):
+            self.module.move_path(source, destination)
+
+        self.assertFalse(source.is_symlink())
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(os.readlink(destination), os.fspath(source_target))
+
     def test_managed_skill_refreshes_and_second_identical_run_is_unchanged(self):
         source = write_skill(self.canonical, "refreshable", "Version one.")
         first_result, _ = self.run_sync()

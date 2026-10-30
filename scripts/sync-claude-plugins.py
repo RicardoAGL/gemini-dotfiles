@@ -719,6 +719,35 @@ def remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def move_path(source: Path, destination: Path) -> None:
+    """Move one owned entry and verify symlink moves do not leave a duplicate."""
+    if not path_exists(source):
+        raise SyncError(f"Cannot move missing path: {source}")
+    if path_exists(destination):
+        raise SyncError(f"Refusing to overwrite move destination: {destination}")
+
+    link_target = os.readlink(source) if source.is_symlink() else None
+    source.rename(destination)
+
+    if link_target is not None:
+        if (
+            not destination.is_symlink()
+            or os.readlink(destination) != link_target
+        ):
+            raise SyncError(
+                f"Symlink move did not preserve the owned link: {source}"
+            )
+        if source.is_symlink():
+            if os.readlink(source) != link_target:
+                raise SyncError(
+                    f"Source symlink changed during move verification: {source}"
+                )
+            source.unlink()
+
+    if path_exists(source) or not path_exists(destination):
+        raise SyncError(f"Move did not transfer the owned path: {source}")
+
+
 def write_json_atomic(path: Path, value: dict) -> None:
     handle, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", dir=path.parent, text=True
@@ -748,8 +777,8 @@ def stage_skill(skill: DesiredSkill, staged: Path) -> None:
 
 def activate_staged_skill(staged: Path, target: Path, backup: Path) -> None:
     if target.exists() or target.is_symlink():
-        target.rename(backup)
-    staged.rename(target)
+        move_path(target, backup)
+    move_path(staged, target)
 
 
 def transaction_path() -> Path:
@@ -1140,7 +1169,7 @@ def rollback_transaction(transaction: Path, journal: dict) -> None:
             if path_exists(backup):
                 if path_exists(target):
                     remove_path(target)
-                backup.rename(target)
+                move_path(backup, target)
             elif not item["hadTarget"]:
                 if path_exists(target):
                     remove_path(target)
@@ -1155,7 +1184,7 @@ def rollback_transaction(transaction: Path, journal: dict) -> None:
             if path_exists(quarantined):
                 if path_exists(target):
                     raise SyncError(f"Cannot restore stale target over existing path: {target}")
-                quarantined.rename(target)
+                move_path(quarantined, target)
             elif not path_exists(target):
                 raise SyncError(f"Transaction lost stale target: {name}")
         except Exception as error:
@@ -1292,7 +1321,7 @@ def run_transaction(
                 name = str(item["name"])
                 target = GEMINI_SKILLS_DIR / name
                 if path_exists(target):
-                    target.rename(quarantine / name)
+                    move_path(target, quarantine / name)
                     metadata_entries[name] = {
                         "reason": str(item["reason"]),
                         "sourceSha256": item.get("oldSha256"),

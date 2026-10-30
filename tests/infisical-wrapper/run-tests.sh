@@ -10,9 +10,10 @@ redirect_native=''
 
 cleanup() {
   if [[ "${OS:-}" == "Windows_NT" && -n "$redirect_native" ]] && command -v powershell.exe >/dev/null 2>&1; then
-    MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -NonInteractive -Command \
-      'if (Test-Path -LiteralPath $args[0]) { Remove-Item -LiteralPath $args[0] -Force -ErrorAction SilentlyContinue }' \
-      "$redirect_native" >/dev/null 2>&1 || true
+    GEMINI_TEST_JUNCTION_PATH="$redirect_native" MSYS_NO_PATHCONV=1 \
+      powershell.exe -NoProfile -NonInteractive -Command \
+      '$link = $env:GEMINI_TEST_JUNCTION_PATH; if (Test-Path -LiteralPath $link) { $item = Get-Item -LiteralPath $link -Force; if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -and $item.LinkType -eq "Junction") { Remove-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue } }' \
+      >/dev/null 2>&1 || true
   fi
   rm -rf "$tmp"
 }
@@ -80,13 +81,14 @@ if [[ "${OS:-}" == "Windows_NT" ]]; then
   if command -v powershell.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
     redirect_native="$(cygpath -w "$redirect")"
     checkout_native="$(cygpath -w "$checkout")"
-    if MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -NonInteractive -Command \
-      '$link = $args[0]; $target = $args[1]; New-Item -ItemType Junction -Path $link -Target $target -ErrorAction Stop | Out-Null' \
-      "$redirect_native" "$checkout_native"; then
-      redirect_created=1
+    if ! GEMINI_TEST_JUNCTION_PATH="$redirect_native" \
+      GEMINI_TEST_JUNCTION_TARGET="$checkout_native" \
+      MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -NonInteractive -Command \
+      '$link = $env:GEMINI_TEST_JUNCTION_PATH; $target = $env:GEMINI_TEST_JUNCTION_TARGET; if ([string]::IsNullOrWhiteSpace($link) -or [string]::IsNullOrWhiteSpace($target)) { throw "Junction fixture paths are missing." }; New-Item -ItemType Junction -Path $link -Target $target -ErrorAction Stop | Out-Null; $item = Get-Item -LiteralPath $link -Force -ErrorAction Stop; if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or $item.LinkType -ne "Junction") { throw "Fixture path is not a junction." }; if (-not [string]::Equals([IO.Path]::GetFullPath([string]$item.Target), [IO.Path]::GetFullPath($target), [StringComparison]::OrdinalIgnoreCase)) { throw "Junction fixture targets the wrong repository." }'; then
+      fail 'Windows junction creation or verification failed'
     fi
-  fi
-  if [[ "$redirect_created" -eq 0 ]]; then
+    redirect_created=1
+  else
     echo 'SKIP: Windows junction creation is unavailable; Linux symlink coverage remains active.'
   fi
 else
@@ -104,8 +106,9 @@ path.write_text(json.dumps(data) + "\n", encoding="utf-8")
 PY
 expect_failure python3 "$runtime" --verify-only "$config"
 if [[ "${OS:-}" == "Windows_NT" ]]; then
-  MSYS_NO_PATHCONV=1 powershell.exe -NoProfile -NonInteractive -Command \
-    'Remove-Item -LiteralPath $args[0] -Force -ErrorAction Stop' "$redirect_native"
+  GEMINI_TEST_JUNCTION_PATH="$redirect_native" MSYS_NO_PATHCONV=1 \
+    powershell.exe -NoProfile -NonInteractive -Command \
+    '$link = $env:GEMINI_TEST_JUNCTION_PATH; $item = Get-Item -LiteralPath $link -Force -ErrorAction Stop; if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or $item.LinkType -ne "Junction") { throw "Refusing to remove a non-junction fixture path." }; Remove-Item -LiteralPath $link -Force -ErrorAction Stop'
 else
   unlink "$redirect"
 fi
