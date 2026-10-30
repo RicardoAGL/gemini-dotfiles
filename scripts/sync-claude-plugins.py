@@ -14,6 +14,8 @@ import json
 import os
 import re
 import shutil
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,6 +23,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from contextlib import contextmanager
 
 
 OWNER = "claude-dotfiles-sync"
@@ -33,12 +36,13 @@ GIT_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 ATTESTED_REVISION_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 QUARANTINE_NAME = ".claude-sync-quarantine"
 TRANSACTION_NAME = ".claude-sync-transaction"
+LOCK_NAME = ".claude-sync.lock"
 
 
 def configured_path(environment_name: str, default: Path) -> Path:
     value = os.environ.get(environment_name)
     selected = Path(value).expanduser() if value else default
-    return selected.resolve(strict=False)
+    return Path(os.path.abspath(os.fspath(selected)))
 
 
 CLAUDE_SETTINGS_PATH = configured_path(
@@ -99,6 +103,23 @@ def is_within(path: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def assert_no_symlink_components(path: Path, label: str) -> None:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    if not absolute.is_absolute():
+        raise SyncError(f"{label} must be absolute: {path}")
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            break
+        except OSError as error:
+            raise SyncError(f"Cannot inspect {label} component {current}: {error}") from error
+        if stat.S_ISLNK(mode):
+            raise SyncError(f"{label} contains a symlink component: {current}")
 
 
 def repository_skill_candidates() -> list[Path]:
@@ -218,6 +239,22 @@ def get_canonical_skills_dirs() -> list[CanonicalRoot]:
     if CLAUDE_USER_SKILLS.is_dir():
         return [attest_deployed_source(CLAUDE_USER_SKILLS)]
     return []
+
+
+def revalidate_canonical_sources(sources: list[CanonicalRoot]) -> None:
+    for source in sources:
+        if source.source_type == "canonical":
+            current = validate_repository_source(
+                source.path, source.path.parent.name
+            )
+        elif source.source_type == "deployed-canonical":
+            current = attest_deployed_source(source.path)
+        else:
+            raise SyncError(f"Unsupported canonical source type: {source.source_type}")
+        if current.path != source.path or current.revision != source.revision:
+            raise SyncError(
+                f"Canonical source changed after discovery and staging: {source.path}"
+            )
 
 
 def legacy_canonical_roots(canonical_roots: list[CanonicalRoot]) -> list[Path]:
@@ -393,8 +430,8 @@ def plugin_identity(plugin_id: str) -> tuple[str, str | None]:
 
 
 def assert_cache_path(path: Path) -> None:
-    if CLAUDE_PLUGINS_CACHE.is_symlink():
-        raise SyncError(f"Claude plugin cache must not be a symlink: {CLAUDE_PLUGINS_CACHE}")
+    assert_no_symlink_components(CLAUDE_PLUGINS_CACHE, "Claude plugin cache")
+    assert_no_symlink_components(path, "Claude plugin cache path")
     cache = CLAUDE_PLUGINS_CACHE.resolve(strict=False)
     resolved = path.resolve(strict=False)
     if not is_within(resolved, cache):
@@ -614,6 +651,15 @@ def load_manifest() -> dict:
     return manifest
 
 
+def manifest_bytes(entries: dict[str, dict[str, str]]) -> bytes:
+    document = {"schemaVersion": SCHEMA_VERSION, "owner": OWNER, "entries": entries}
+    return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def write_manifest(entries: dict[str, dict[str, str]]) -> None:
     manifest_path = GEMINI_SKILLS_DIR / MANIFEST_NAME
     handle, temporary_name = tempfile.mkstemp(
@@ -621,14 +667,8 @@ def write_manifest(entries: dict[str, dict[str, str]]) -> None:
     )
     temporary_path = Path(temporary_name)
     try:
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            json.dump(
-                {"schemaVersion": SCHEMA_VERSION, "owner": OWNER, "entries": entries},
-                stream,
-                indent=2,
-                sort_keys=True,
-            )
-            stream.write("\n")
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(manifest_bytes(entries))
         os.chmod(temporary_path, 0o600)
         os.replace(temporary_path, manifest_path)
     finally:
@@ -706,6 +746,108 @@ def path_exists(path: Path) -> bool:
     return path.exists() or path.is_symlink()
 
 
+def validate_owner(owner: object) -> dict:
+    if not isinstance(owner, dict) or set(owner) != {
+        "token",
+        "pid",
+        "host",
+        "createdAt",
+    }:
+        raise SyncError("Skill sync owner record has an invalid schema.")
+    if (
+        not isinstance(owner["token"], str)
+        or not re.fullmatch(r"[0-9a-f]{32}", owner["token"])
+        or not isinstance(owner["pid"], int)
+        or owner["pid"] <= 0
+        or not isinstance(owner["host"], str)
+        or not owner["host"]
+        or not isinstance(owner["createdAt"], str)
+        or not owner["createdAt"]
+    ):
+        raise SyncError("Skill sync owner record has invalid values.")
+    return owner
+
+
+def read_lock_owner(lock_path: Path) -> dict:
+    if lock_path.is_symlink() or not lock_path.is_file():
+        raise SyncError(f"Skill sync lock must be a regular file: {lock_path}")
+    if os.name != "nt" and lock_path.stat().st_mode & 0o077:
+        raise SyncError(f"Skill sync lock permissions must be owner-only: {lock_path}")
+    try:
+        return validate_owner(json.loads(lock_path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SyncError(f"Cannot read skill sync lock {lock_path}: {error}") from error
+
+
+def owner_is_active(owner: dict) -> bool:
+    if owner["host"] != socket.gethostname():
+        return True
+    try:
+        os.kill(owner["pid"], 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+@contextmanager
+def exclusive_sync_lock():
+    assert_no_symlink_components(GEMINI_SKILLS_DIR, "Gemini skill root")
+    if GEMINI_SKILLS_DIR.exists() and not GEMINI_SKILLS_DIR.is_dir():
+        raise SyncError(f"Gemini skill root must be a directory: {GEMINI_SKILLS_DIR}")
+    GEMINI_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    assert_no_symlink_components(GEMINI_SKILLS_DIR, "Gemini skill root")
+    lock_path = GEMINI_SKILLS_DIR / LOCK_NAME
+    owner = {
+        "token": uuid.uuid4().hex,
+        "pid": os.getpid(),
+        "host": socket.gethostname(),
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+    }
+    for attempt in range(2):
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(lock_path, flags, 0o600)
+        except FileExistsError:
+            existing_stat = os.lstat(lock_path)
+            existing = read_lock_owner(lock_path)
+            if owner_is_active(existing):
+                raise SyncError(
+                    f"Another Gemini skill sync is active on {existing['host']} "
+                    f"with pid {existing['pid']}."
+                )
+            if attempt:
+                raise SyncError(f"Cannot replace stale skill sync lock: {lock_path}")
+            if os.lstat(lock_path).st_ino != existing_stat.st_ino:
+                raise SyncError(f"Skill sync lock changed during inspection: {lock_path}")
+            if read_lock_owner(lock_path)["token"] != existing["token"]:
+                raise SyncError(f"Skill sync lock owner changed during inspection: {lock_path}")
+            lock_path.unlink()
+            continue
+        except OSError as error:
+            raise SyncError(f"Cannot acquire skill sync lock {lock_path}: {error}") from error
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(owner, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        break
+    else:  # pragma: no cover - loop either acquires or raises
+        raise SyncError(f"Cannot acquire skill sync lock: {lock_path}")
+    try:
+        yield owner
+    finally:
+        try:
+            current = read_lock_owner(lock_path)
+            if current["token"] == owner["token"]:
+                lock_path.unlink()
+        except (OSError, SyncError):
+            pass
+
+
 def validate_transaction_journal(journal_path: Path) -> dict:
     if journal_path.is_symlink() or not journal_path.is_file():
         raise SyncError(f"Skill transaction journal must be a regular file: {journal_path}")
@@ -717,6 +859,16 @@ def validate_transaction_journal(journal_path: Path) -> dict:
         raise SyncError(f"Cannot read skill transaction journal: {error}") from error
     if (
         not isinstance(journal, dict)
+        or set(journal) != {
+            "schemaVersion",
+            "owner",
+            "manifestExisted",
+            "manifestBeforeSha256",
+            "manifestAfterSha256",
+            "quarantine",
+            "replacements",
+            "stale",
+        }
         or journal.get("schemaVersion") != 1
         or not isinstance(journal.get("manifestExisted"), bool)
         or not isinstance(journal.get("replacements"), list)
@@ -724,6 +876,18 @@ def validate_transaction_journal(journal_path: Path) -> dict:
         or not isinstance(journal.get("quarantine"), str)
     ):
         raise SyncError("Skill transaction journal has an invalid schema.")
+    validate_owner(journal["owner"])
+    before_hash = journal["manifestBeforeSha256"]
+    after_hash = journal["manifestAfterSha256"]
+    if (
+        (before_hash is not None and (
+            not isinstance(before_hash, str) or not SHA256_PATTERN.fullmatch(before_hash)
+        ))
+        or not isinstance(after_hash, str)
+        or not SHA256_PATTERN.fullmatch(after_hash)
+        or journal["manifestExisted"] != (before_hash is not None)
+    ):
+        raise SyncError("Skill transaction manifest hashes are invalid.")
     quarantine_root = GEMINI_SKILLS_DIR / QUARANTINE_NAME
     if quarantine_root.is_symlink():
         raise SyncError(f"Skill quarantine root must not be a symlink: {quarantine_root}")
@@ -782,6 +946,116 @@ def validate_transaction_journal(journal_path: Path) -> dict:
 
 def rollback_transaction(transaction: Path, journal: dict) -> None:
     quarantine = Path(journal["quarantine"])
+    manifest = GEMINI_SKILLS_DIR / MANIFEST_NAME
+    manifest_backup = transaction / "manifest.backup"
+    unsafe: list[str] = []
+
+    assert_no_symlink_components(transaction, "Skill transaction path")
+    if quarantine.exists() or quarantine.is_symlink():
+        assert_no_symlink_components(quarantine, "Skill quarantine batch")
+
+    for item in journal["replacements"]:
+        name = item["name"]
+        target = GEMINI_SKILLS_DIR / name
+        backup = transaction / "backups" / name
+        if path_exists(backup):
+            old_sha = item.get("oldSha256")
+            if not item["hadTarget"]:
+                unsafe.append(f"{name}: unexpected backup exists for a new install")
+            elif old_sha and (
+                backup.is_symlink()
+                or not backup.is_dir()
+                or target_hash(backup) != old_sha
+            ):
+                unsafe.append(f"{name}: transaction backup changed before recovery")
+            elif old_sha is None and not backup.is_symlink():
+                unsafe.append(f"{name}: legacy transaction backup is not a symlink")
+            if path_exists(target):
+                if (
+                    target.is_symlink()
+                    or not target.is_dir()
+                    or target_hash(target) != item["newSha256"]
+                ):
+                    unsafe.append(
+                        f"{name}: current target does not match the journaled new snapshot"
+                    )
+        elif not item["hadTarget"]:
+            if path_exists(target) and (
+                target.is_symlink()
+                or not target.is_dir()
+                or target_hash(target) != item["newSha256"]
+            ):
+                unsafe.append(f"{name}: unexpected target appeared during recovery")
+        elif path_exists(target):
+            expected = item.get("oldSha256")
+            if (
+                target.is_symlink()
+                or not target.is_dir()
+                or not expected
+                or target_hash(target) != expected
+            ):
+                unsafe.append(f"{name}: pre-transaction target cannot be verified")
+        else:
+            unsafe.append(f"{name}: transaction lost both target and backup")
+
+    for item in journal["stale"]:
+        name = item["name"]
+        target = GEMINI_SKILLS_DIR / name
+        quarantined = quarantine / name
+        if path_exists(quarantined):
+            old_sha = item.get("oldSha256")
+            if old_sha and (
+                quarantined.is_symlink()
+                or not quarantined.is_dir()
+                or target_hash(quarantined) != old_sha
+            ):
+                unsafe.append(f"{name}: quarantined snapshot changed before recovery")
+            elif old_sha is None and not quarantined.is_symlink():
+                unsafe.append(f"{name}: quarantined legacy entry is not a symlink")
+            if path_exists(target):
+                unsafe.append(f"{name}: target exists beside quarantined recovery copy")
+        elif not path_exists(target):
+            unsafe.append(f"{name}: transaction lost stale target")
+        elif item.get("oldSha256"):
+            if (
+                target.is_symlink()
+                or not target.is_dir()
+                or target_hash(target) != item["oldSha256"]
+            ):
+                unsafe.append(f"{name}: stale target changed before recovery")
+        elif not target.is_symlink():
+            unsafe.append(f"{name}: legacy stale target is no longer a symlink")
+
+    before_hash = journal["manifestBeforeSha256"]
+    after_hash = journal["manifestAfterSha256"]
+    if journal["manifestExisted"]:
+        if (
+            manifest_backup.is_symlink()
+            or not manifest_backup.is_file()
+            or file_sha256(manifest_backup) != before_hash
+        ):
+            unsafe.append("manifest: transaction backup is missing or changed")
+    elif path_exists(manifest_backup):
+        unsafe.append("manifest: unexpected backup exists")
+    if path_exists(manifest):
+        if manifest.is_symlink() or not manifest.is_file():
+            unsafe.append("manifest: current path is not a regular file")
+        else:
+            current_hash = file_sha256(manifest)
+            allowed_hashes = {after_hash}
+            if before_hash:
+                allowed_hashes.add(before_hash)
+            if current_hash not in allowed_hashes:
+                unsafe.append("manifest: current contents are not journal-owned")
+    elif journal["manifestExisted"]:
+        unsafe.append("manifest: pre-transaction manifest disappeared")
+
+    if unsafe:
+        raise SyncError(
+            "Skill sync recovery requires manual inspection; current state and "
+            "transaction evidence were preserved:\n- " + "\n- ".join(unsafe)
+        )
+
     rollback_errors: list[str] = []
 
     for item in reversed(journal["replacements"]):
@@ -795,15 +1069,7 @@ def rollback_transaction(transaction: Path, journal: dict) -> None:
                 backup.rename(target)
             elif not item["hadTarget"]:
                 if path_exists(target):
-                    if target.is_symlink() or target_hash(target) != item["newSha256"]:
-                        raise SyncError(f"Cannot safely roll back unexpected target: {target}")
                     remove_path(target)
-            elif path_exists(target):
-                expected = item.get("oldSha256")
-                if target.is_symlink() or not expected or target_hash(target) != expected:
-                    raise SyncError(f"Cannot safely identify pre-transaction target: {target}")
-            else:
-                raise SyncError(f"Transaction lost both target and backup: {name}")
         except Exception as error:  # preserve all evidence on rollback failure
             rollback_errors.append(f"{name}: {error}")
 
@@ -821,16 +1087,10 @@ def rollback_transaction(transaction: Path, journal: dict) -> None:
         except Exception as error:
             rollback_errors.append(f"{name}: {error}")
 
-    manifest = GEMINI_SKILLS_DIR / MANIFEST_NAME
-    manifest_backup = transaction / "manifest.backup"
     try:
         if journal["manifestExisted"]:
-            if not manifest_backup.is_file():
-                raise SyncError("Transaction lost its manifest backup.")
             os.replace(manifest_backup, manifest)
         elif path_exists(manifest):
-            if manifest.is_symlink() or not manifest.is_file():
-                raise SyncError("Cannot remove unexpected manifest during rollback.")
             manifest.unlink()
     except Exception as error:
         rollback_errors.append(f"manifest: {error}")
@@ -852,7 +1112,7 @@ def rollback_transaction(transaction: Path, journal: dict) -> None:
     remove_path(transaction)
 
 
-def recover_pending_transaction() -> None:
+def recover_pending_transaction(current_owner: dict) -> None:
     transaction = transaction_path()
     if transaction.is_symlink():
         raise SyncError(f"Skill transaction path must not be a symlink: {transaction}")
@@ -864,6 +1124,15 @@ def recover_pending_transaction() -> None:
             f"Unjournaled skill transaction requires manual inspection: {transaction}"
         )
     journal = validate_transaction_journal(journal_path)
+    previous_owner = journal["owner"]
+    if (
+        previous_owner["pid"] != current_owner["pid"]
+        or previous_owner["host"] != current_owner["host"]
+    ) and owner_is_active(previous_owner):
+        raise SyncError(
+            f"Skill transaction is owned by an active or unverifiable process on "
+            f"{previous_owner['host']} with pid {previous_owner['pid']}."
+        )
     rollback_transaction(transaction, journal)
 
 
@@ -872,6 +1141,8 @@ def run_transaction(
     actions: dict[str, str],
     stale: list[dict[str, str | None]],
     old_manifest_exists: bool,
+    canonical_sources: list[CanonicalRoot],
+    owner: dict,
 ) -> int:
     transaction = transaction_path()
     transaction.mkdir()
@@ -882,11 +1153,17 @@ def run_transaction(
     changed_names = [name for name in sorted(desired) if actions[name] != "unchanged"]
     quarantine = quarantine_batch_path()
     manifest_path = GEMINI_SKILLS_DIR / MANIFEST_NAME
+    entries = {name: desired[name].manifest_entry() for name in sorted(desired)}
+    manifest_before_sha = file_sha256(manifest_path) if old_manifest_exists else None
+    manifest_after_sha = hashlib.sha256(manifest_bytes(entries)).hexdigest()
     if old_manifest_exists:
         shutil.copy2(manifest_path, transaction / "manifest.backup")
     initial_journal = {
         "schemaVersion": 1,
+        "owner": owner,
         "manifestExisted": old_manifest_exists,
+        "manifestBeforeSha256": manifest_before_sha,
+        "manifestAfterSha256": manifest_after_sha,
         "quarantine": str(quarantine),
         "replacements": [],
         "stale": [],
@@ -895,6 +1172,7 @@ def run_transaction(
     try:
         for name in changed_names:
             stage_skill(desired[name], staged_root / name)
+        revalidate_canonical_sources(canonical_sources)
     except Exception:
         remove_path(transaction)
         raise
@@ -915,7 +1193,10 @@ def run_transaction(
         )
     journal = {
         "schemaVersion": 1,
+        "owner": owner,
         "manifestExisted": old_manifest_exists,
+        "manifestBeforeSha256": manifest_before_sha,
+        "manifestAfterSha256": manifest_after_sha,
         "quarantine": str(quarantine),
         "replacements": replacements,
         "stale": stale,
@@ -946,7 +1227,6 @@ def run_transaction(
                 quarantine / "quarantine-manifest.json",
                 {"owner": OWNER, "entries": metadata_entries},
             )
-        entries = {name: desired[name].manifest_entry() for name in sorted(desired)}
         write_manifest(entries)
     except Exception:
         rollback_transaction(transaction, journal)
@@ -958,12 +1238,12 @@ def run_transaction(
 
 def sync_managed_skills(
     desired: dict[str, DesiredSkill],
-    canonical_roots: list[Path],
+    canonical_sources: list[CanonicalRoot],
+    owner: dict,
 ) -> tuple[int, int]:
-    if GEMINI_SKILLS_DIR.is_symlink():
-        raise SyncError(f"Managed skill root must not be a symlink: {GEMINI_SKILLS_DIR}")
-    GEMINI_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-    recover_pending_transaction()
+    assert_no_symlink_components(GEMINI_SKILLS_DIR, "Gemini skill root")
+    canonical_roots = legacy_canonical_roots(canonical_sources)
+    recover_pending_transaction(owner)
     manifest = load_manifest()
     old_entries = manifest["entries"]
     conflicts: list[str] = []
@@ -1044,21 +1324,22 @@ def sync_managed_skills(
         actions,
         stale,
         (GEMINI_SKILLS_DIR / MANIFEST_NAME).exists(),
+        canonical_sources,
+        owner,
     )
     return len(desired), changed
 
 
 def main() -> int:
     print("=== Syncing managed Claude skills to Gemini/Antigravity ===")
-    canonical_roots = get_canonical_skills_dirs()
-    if not canonical_roots:
-        raise SyncError("No canonical Claude skill directory was found.")
-    enabled_plugins = get_enabled_plugins()
-    desired = discover_canonical_skills(canonical_roots)
-    discover_plugin_skills(enabled_plugins, desired)
-    active, changed = sync_managed_skills(
-        desired, legacy_canonical_roots(canonical_roots)
-    )
+    with exclusive_sync_lock() as owner:
+        canonical_roots = get_canonical_skills_dirs()
+        if not canonical_roots:
+            raise SyncError("No canonical Claude skill directory was found.")
+        enabled_plugins = get_enabled_plugins()
+        desired = discover_canonical_skills(canonical_roots)
+        discover_plugin_skills(enabled_plugins, desired)
+        active, changed = sync_managed_skills(desired, canonical_roots, owner)
     plugin_count = sum(1 for skill in desired.values() if skill.source_type == "plugin")
     canonical_count = active - plugin_count
     print(
