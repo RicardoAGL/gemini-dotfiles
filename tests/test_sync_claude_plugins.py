@@ -200,9 +200,11 @@ class SkillSyncTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertFalse(stale.is_symlink())
-        quarantined = list(
-            (self.target / ".claude-sync-quarantine").glob("*/old-branch-skill")
-        )
+        quarantined = [
+            candidate / "old-branch-skill"
+            for candidate in (self.target / ".claude-sync-quarantine").iterdir()
+            if (candidate / "old-branch-skill").is_symlink()
+        ]
         self.assertEqual(len(quarantined), 1)
         self.assertTrue(quarantined[0].is_symlink())
         self.assertIn("quarantined stale managed skill: old-branch-skill", output)
