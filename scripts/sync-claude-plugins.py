@@ -10,6 +10,7 @@ can update or quarantine only entries this script owns.
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -44,6 +45,9 @@ WINDOWS_SYNCHRONIZE = 0x00100000
 WINDOWS_WAIT_OBJECT_0 = 0x00000000
 WINDOWS_WAIT_TIMEOUT = 0x00000102
 WINDOWS_STILL_ACTIVE = 259
+LINUX_AT_FDCWD = -100
+LINUX_RENAME_NOREPLACE = 1
+DARWIN_RENAME_EXCL = 0x00000004
 
 
 def configured_path(environment_name: str, default: Path) -> Path:
@@ -719,33 +723,111 @@ def remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def move_path(source: Path, destination: Path) -> None:
-    """Move one owned entry and verify symlink moves do not leave a duplicate."""
-    if not path_exists(source):
-        raise SyncError(f"Cannot move missing path: {source}")
-    if path_exists(destination):
-        raise SyncError(f"Refusing to overwrite move destination: {destination}")
+def atomic_move_noreplace(source: Path, destination: Path) -> None:
+    """Atomically move one path without replacing an existing destination."""
+    source_path = os.fspath(source)
+    destination_path = os.fspath(destination)
 
-    link_target = os.readlink(source) if source.is_symlink() else None
-    source.rename(destination)
-
-    if link_target is not None:
-        if (
-            not destination.is_symlink()
-            or os.readlink(destination) != link_target
-        ):
-            raise SyncError(
-                f"Symlink move did not preserve the owned link: {source}"
+    if sys.platform.startswith("linux"):
+        libc = ctypes.CDLL(None, use_errno=True)
+        try:
+            renameat2 = libc.renameat2
+        except AttributeError as error:
+            raise OSError(errno.ENOSYS, "renameat2 is unavailable") from error
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = renameat2(
+            LINUX_AT_FDCWD,
+            os.fsencode(source_path),
+            LINUX_AT_FDCWD,
+            os.fsencode(destination_path),
+            LINUX_RENAME_NOREPLACE,
+        )
+        if result != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(
+                error_number,
+                os.strerror(error_number),
+                source_path,
+                destination_path,
             )
-        if source.is_symlink():
-            if os.readlink(source) != link_target:
-                raise SyncError(
-                    f"Source symlink changed during move verification: {source}"
-                )
-            source.unlink()
+        return
 
-    if path_exists(source) or not path_exists(destination):
-        raise SyncError(f"Move did not transfer the owned path: {source}")
+    if sys.platform == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        try:
+            renamex_np = libc.renamex_np
+        except AttributeError as error:
+            raise OSError(errno.ENOSYS, "renamex_np is unavailable") from error
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = renamex_np(
+            os.fsencode(source_path),
+            os.fsencode(destination_path),
+            DARWIN_RENAME_EXCL,
+        )
+        if result != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(
+                error_number,
+                os.strerror(error_number),
+                source_path,
+                destination_path,
+            )
+        return
+
+    if sys.platform == "win32":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        move_file = kernel32.MoveFileExW
+        move_file.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+        move_file.restype = wintypes.BOOL
+        ctypes.set_last_error(0)
+        # No MOVEFILE_REPLACE_EXISTING or COPY_ALLOWED: same-volume, no-replace move.
+        if not move_file(source_path, destination_path, 0):
+            error_number = ctypes.get_last_error()
+            raise ctypes.WinError(error_number)
+        return
+
+    raise OSError(
+        errno.ENOSYS,
+        f"atomic no-replace move is unsupported on {sys.platform}",
+    )
+
+
+def move_path(source: Path, destination: Path) -> None:
+    """Move one owned entry with no-replace and fail-closed identity checks."""
+    try:
+        source_identity = source.lstat()
+    except OSError as error:
+        raise SyncError(f"Cannot identify move source: {source}") from error
+
+    try:
+        atomic_move_noreplace(source, destination)
+    except OSError as error:
+        raise SyncError(
+            f"Atomic move failed for {source} -> {destination}: {error}"
+        ) from error
+
+    try:
+        destination_identity = destination.lstat()
+    except OSError as error:
+        raise SyncError(
+            f"Atomic move destination is missing: {destination}"
+        ) from error
+    if not os.path.samestat(source_identity, destination_identity):
+        raise SyncError(
+            f"Destination identity changed during atomic move: {destination}"
+        )
+    if path_exists(source):
+        raise SyncError(f"Source path was recreated during atomic move: {source}")
 
 
 def write_json_atomic(path: Path, value: dict) -> None:

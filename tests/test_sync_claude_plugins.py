@@ -22,6 +22,18 @@ SCRIPT_PATH = REPO_ROOT / "scripts" / "sync-claude-plugins.py"
 MANIFEST_NAME = ".claude-sync-manifest.json"
 
 
+class FakeNativeFunction:
+    def __init__(self, return_value: int):
+        self.return_value = return_value
+        self.calls: list[tuple[object, ...]] = []
+        self.argtypes: list[object] = []
+        self.restype: object | None = None
+
+    def __call__(self, *args: object) -> int:
+        self.calls.append(args)
+        return self.return_value
+
+
 def load_sync_module():
     spec = importlib.util.spec_from_file_location("sync_claude_plugins", SCRIPT_PATH)
     if spec is None or spec.loader is None:
@@ -195,25 +207,135 @@ class SkillSyncTests(unittest.TestCase):
         self.assertTrue(quarantined[0].is_symlink())
         self.assertIn("quarantined stale managed skill: old-branch-skill", output)
 
-    def test_move_path_removes_source_when_rename_duplicates_symlink(self):
-        source_target = self.root / "missing-skill"
-        source = self.root / "source-link"
-        destination = self.root / "destination-link"
-        source.symlink_to(source_target, target_is_directory=True)
-        original_rename = Path.rename
+    def test_move_path_preserves_substituted_destination(self):
+        source = self.root / "source"
+        destination = self.root / "destination"
+        attacker_target = self.root / "attacker-target"
+        source.mkdir()
 
-        def duplicate_symlink(path: Path, target: Path) -> Path:
-            if path == source:
-                target.symlink_to(os.readlink(path), target_is_directory=True)
-                return target
-            return original_rename(path, target)
+        def substitute_destination(_source: Path, _destination: Path) -> None:
+            _source.rename(_destination)
+            _destination.rmdir()
+            _destination.symlink_to(attacker_target, target_is_directory=True)
 
-        with mock.patch.object(Path, "rename", duplicate_symlink):
+        with mock.patch.object(
+            self.module,
+            "atomic_move_noreplace",
+            side_effect=substitute_destination,
+        ):
+            with self.assertRaisesRegex(
+                self.module.SyncError, "identity changed during atomic move"
+            ):
+                self.module.move_path(source, destination)
+
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(os.readlink(destination), os.fspath(attacker_target))
+
+    def test_move_path_preserves_recreated_source(self):
+        source = self.root / "source"
+        destination = self.root / "destination"
+        attacker_target = self.root / "attacker-target"
+        source.mkdir()
+
+        def recreate_source(_source: Path, _destination: Path) -> None:
+            _source.rename(_destination)
+            _source.symlink_to(attacker_target, target_is_directory=True)
+
+        with mock.patch.object(
+            self.module,
+            "atomic_move_noreplace",
+            side_effect=recreate_source,
+        ):
+            with self.assertRaisesRegex(
+                self.module.SyncError, "Source path was recreated during atomic move"
+            ):
+                self.module.move_path(source, destination)
+
+        self.assertTrue(source.is_symlink())
+        self.assertEqual(os.readlink(source), os.fspath(attacker_target))
+        self.assertTrue(destination.is_dir())
+
+    def test_move_path_does_not_replace_existing_destination(self):
+        source = self.root / "source"
+        destination = self.root / "destination"
+        source.mkdir()
+        destination.mkdir()
+
+        with self.assertRaisesRegex(self.module.SyncError, "Atomic move failed"):
             self.module.move_path(source, destination)
 
-        self.assertFalse(source.is_symlink())
-        self.assertTrue(destination.is_symlink())
-        self.assertEqual(os.readlink(destination), os.fspath(source_target))
+        self.assertTrue(source.is_dir())
+        self.assertTrue(destination.is_dir())
+
+    def test_linux_atomic_move_uses_exact_paths_and_noreplace(self):
+        renameat2 = FakeNativeFunction(0)
+        libc = SimpleNamespace(renameat2=renameat2)
+        source = Path("literal/../source")
+        destination = Path("literal/../destination")
+
+        with (
+            mock.patch.object(self.module.sys, "platform", "linux"),
+            mock.patch.object(self.module.ctypes, "CDLL", return_value=libc),
+            mock.patch.object(self.module.ctypes, "set_errno"),
+        ):
+            self.module.atomic_move_noreplace(source, destination)
+
+        self.assertEqual(
+            renameat2.calls,
+            [
+                (
+                    self.module.LINUX_AT_FDCWD,
+                    os.fsencode(os.fspath(source)),
+                    self.module.LINUX_AT_FDCWD,
+                    os.fsencode(os.fspath(destination)),
+                    self.module.LINUX_RENAME_NOREPLACE,
+                )
+            ],
+        )
+
+    def test_darwin_atomic_move_uses_exact_paths_and_exclusive_flag(self):
+        renamex_np = FakeNativeFunction(0)
+        libc = SimpleNamespace(renamex_np=renamex_np)
+        source = Path("literal/../source")
+        destination = Path("literal/../destination")
+
+        with (
+            mock.patch.object(self.module.sys, "platform", "darwin"),
+            mock.patch.object(self.module.ctypes, "CDLL", return_value=libc),
+            mock.patch.object(self.module.ctypes, "set_errno"),
+        ):
+            self.module.atomic_move_noreplace(source, destination)
+
+        self.assertEqual(
+            renamex_np.calls,
+            [
+                (
+                    os.fsencode(os.fspath(source)),
+                    os.fsencode(os.fspath(destination)),
+                    self.module.DARWIN_RENAME_EXCL,
+                )
+            ],
+        )
+
+    def test_windows_atomic_move_uses_exact_paths_without_replace_flags(self):
+        move_file = FakeNativeFunction(1)
+        kernel32 = SimpleNamespace(MoveFileExW=move_file)
+        source = Path("literal/../source")
+        destination = Path("literal/../destination")
+
+        with (
+            mock.patch.object(self.module.sys, "platform", "win32"),
+            mock.patch.object(
+                self.module.ctypes, "WinDLL", create=True, return_value=kernel32
+            ),
+            mock.patch.object(self.module.ctypes, "set_last_error", create=True),
+        ):
+            self.module.atomic_move_noreplace(source, destination)
+
+        self.assertEqual(
+            move_file.calls,
+            [(os.fspath(source), os.fspath(destination), 0)],
+        )
 
     def test_managed_skill_refreshes_and_second_identical_run_is_unchanged(self):
         source = write_skill(self.canonical, "refreshable", "Version one.")
