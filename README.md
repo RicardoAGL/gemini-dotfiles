@@ -16,6 +16,7 @@ Claude remains the canonical source of truth. This repo translates the portable 
 - Global Gemini settings at `~/.gemini/settings.json`
 - Repo onboarding helper for Claude-first projects
 - Shell alias/profile wiring for `gem`
+- Shared `infisical-safe-wrapper` command installation when the sibling repo is present
 
 ## Canonical Sources
 
@@ -46,6 +47,8 @@ bash scripts/bootstrap.sh
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\github\gemini-dotfiles\scripts\bootstrap.ps1
 ```
+
+If the sibling repo `~/Desktop/github/infisical-safe-wrapper` exists, bootstrap also installs the shared `infisical-safe-wrapper` command on PATH so Gemini CLI can call the same secret-safe runtime as the other agents.
 
 Prepare a repo the first time Gemini CLI should work there:
 
@@ -98,6 +101,6 @@ powershell -ExecutionPolicy Bypass -File C:\github\gemini-dotfiles\scripts\ci\lo
 - `scripts/install-gemini-cli.ps1`
 - `scripts/bootstrap.sh`
 - `scripts/bootstrap.ps1`
+- both bootstrap scripts also install the shared `infisical-safe-wrapper` wrapper when available
 - `scripts/use-project.sh`
 - `scripts/use-project.ps1`
-

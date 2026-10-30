@@ -47,8 +47,17 @@ get_canonical_repo_path() {
   printf '%s/%s\n' "$(get_workspace_root)" "$repo_name"
 }
 
+workspace_path_from_source_map() {
+  local key_path="$1"
+  printf '%s/%s\n' "$(get_workspace_root)" "$(source_map_value "$key_path")"
+}
+
 ensure_dir() {
   mkdir -p "$1"
+}
+
+get_user_bin_dir() {
+  printf '%s/.local/bin\n' "$HOME"
 }
 
 get_gemini_home() {
@@ -220,6 +229,28 @@ ensure_unix_alias() {
   fi
 }
 
+ensure_infisical_safe_wrapper_shell_wrapper() {
+  local wrapper_repo="$1"
+  local repo_wrapper="$wrapper_repo/bin/infisical-safe-wrapper.sh"
+  local wrapper_dir wrapper_path
+
+  if [[ ! -f "$repo_wrapper" ]]; then
+    echo "Skipping infisical-safe-wrapper install because entrypoint is missing: $repo_wrapper"
+    return 0
+  fi
+
+  wrapper_dir="$(get_user_bin_dir)"
+  wrapper_path="$wrapper_dir/infisical-safe-wrapper"
+  mkdir -p "$wrapper_dir"
+  cat > "$wrapper_path" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec bash "$repo_wrapper" "\$@"
+EOF
+  chmod +x "$wrapper_path"
+  echo "Installed infisical-safe-wrapper shell wrapper in $wrapper_dir"
+}
+
 write_project_gemini_wrapper() {
   local project_root="${1:?project root required}"
   local target="$project_root/GEMINI.md"
@@ -241,4 +272,3 @@ write_project_gemini_wrapper() {
 
   printf '%s\n' "$target"
 }
-

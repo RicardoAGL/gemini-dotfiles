@@ -82,6 +82,15 @@ function Get-CanonicalRepoPath {
     return Join-Path (Get-WorkspaceRoot) $Name
 }
 
+function Get-WorkspacePathFromSourceMap {
+    param([Parameter(Mandatory = $true)][string]$PathKey)
+    return Join-Path (Get-WorkspaceRoot) (Get-SourceMapValue -PathKey $PathKey)
+}
+
+function Get-UserBinDir {
+    return Join-Path $HOME 'bin'
+}
+
 function Get-MarkdownSection {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -271,6 +280,38 @@ function Ensure-WindowsGemWrapper {
         $newPath = if ($userPath) { $userPath.TrimEnd(';') + ';' + $binDirNormalized } else { $binDirNormalized }
         [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
     }
+}
+
+function Ensure-InfisicalSafeWrapper {
+    $wrapperRepo = Get-WorkspacePathFromSourceMap -PathKey 'integrations.infisicalWrapper.repoPath'
+    $repoWrapper = Join-Path $wrapperRepo 'bin\infisical-safe-wrapper.ps1'
+    if (-not (Test-Path -LiteralPath $repoWrapper)) {
+        Write-Host "Skipping infisical-safe-wrapper install because entrypoint is missing: $repoWrapper"
+        return
+    }
+
+    $binDir = Get-UserBinDir
+    Ensure-Directory -Path $binDir
+
+    $cmdPath = Join-Path $binDir 'infisical-safe-wrapper.cmd'
+    $ps1Path = Join-Path $binDir 'infisical-safe-wrapper.ps1'
+    $cmdContent = "@echo off`r`npowershell -ExecutionPolicy Bypass -File ""$repoWrapper"" %*`r`n"
+    $ps1Content = "& '$repoWrapper' @args`r`n"
+    Set-Content -LiteralPath $cmdPath -Value $cmdContent -NoNewline
+    Set-Content -LiteralPath $ps1Path -Value $ps1Content -NoNewline
+
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $binDirNormalized = $binDir.TrimEnd('\')
+    $pathEntries = @()
+    if ($userPath) {
+        $pathEntries = $userPath -split ';' | Where-Object { $_ }
+    }
+    if ($pathEntries -notcontains $binDirNormalized) {
+        $newPath = if ($userPath) { $userPath.TrimEnd(';') + ';' + $binDirNormalized } else { $binDirNormalized }
+        [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+    }
+
+    Write-Host "Installed infisical-safe-wrapper PATH wrappers in $binDir"
 }
 
 function Write-ProjectGeminiWrapper {
